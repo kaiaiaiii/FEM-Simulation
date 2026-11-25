@@ -1,0 +1,16 @@
+# Abhängigkeiten für fem_interaktiv_v2.py (und fem_interaktiv.py)
+# Installation: pip install -r requirements.txt
+# Getestet mit Python 3.10+
+
+numpy>=1.24
+scipy>=1.11
+pyvista>=0.43
+gmsh>=4.11
+
+# Optional: beschleunigt die Lösung großer Modelle (>60000 Freiheitsgrade)
+# pyamg>=5.0
+# pip install -r requirements.txt
+
+# tkinter (Dialoge) gehört zur Python-Standardbibliothek, ist unter Linux aber
+# oft ein separates Paket:  sudo apt install python3-tk
+# Ohne tkinter: Skript mit --konsole starten.
