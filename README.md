@@ -27,4 +27,6 @@ The list gets changed on and on, and I am open for any ideas:
 ### performace/QOL
 1. parallelisation
 2. shift to cpp?
+3. language
+
 
