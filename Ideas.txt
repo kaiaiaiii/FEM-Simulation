@@ -1,1 +1,0 @@
-Starting with FEM going to topology optimisation stuff 
