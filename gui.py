@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 fem_gui.py - Interaktive FEM mit Grafikfenster (Qt + PyVista)
 =============================================================

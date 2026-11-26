@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 fem_core.py - Rechenkern fuer die interaktive FEM (ohne Grafik, ohne GUI)
 =========================================================================
