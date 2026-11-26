@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "geometry": {"file": null, "unit": "mm"},
+  "mesh": {"h": 6.0, "hmin": null, "curv": 12.0, "order": 2, "refinements": [], "file": null},
+  "material": {"name": "Baustahl S235", "E": 210000.0, "nu": 0.3, "rp": 235.0, "rho": 7.85},
+  "supports": [
+    {"name": "Einspannung x=0",
+     "select": {"plane": {"axis": "x", "value": 0}},
+     "mask": [true, true, true], "values": [0, 0, 0]}
+  ],
+  "loads": [
+    {"name": "Last am freien Ende",
+     "select": {"plane": {"axis": "x", "value": 100}},
+     "force": [0, 0, -500]}
+  ],
+  "analysis": {"type": "static",
+               "topopt": {"volfrac": 0.4, "rmin": null, "penal": 3.0, "maxit": 60}},
+  "output": {"file": "beispiel_ergebnis.vtk"}
+}

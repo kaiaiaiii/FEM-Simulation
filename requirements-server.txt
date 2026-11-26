@@ -1,0 +1,13 @@
+# Nur fuer die Berechnung ohne Grafik:  python fem_core.py run setup.json
+# Installation: pip install -r requirements-server.txt
+
+numpy>=1.24
+scipy>=1.11
+gmsh>=4.11          # nur noetig, wenn das Setup kein mitgespeichertes Netz (.mesh.npz) enthaelt
+
+# Optional:
+# pyamg>=5.0        # schnellerer Loeser fuer grosse Modelle
+# pyvista>=0.43     # nur fuer .vtu-Ausgabe und STL/OBJ-Bereinigung; .vtk geht ohne
+
+# Hinweis Linux-Server: das gmsh-Paket braucht ggf. Systembibliotheken, z.B.
+#   sudo apt install libglu1-mesa libxrender1 libxcursor1 libxft2 libxinerama1
