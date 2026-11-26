@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Interaktive lineare FEM mit Topologieoptimierung (v2)
 =====================================================
@@ -18,12 +19,15 @@ Installation
 
 Aufruf
 ------
-    python fem_interaktiv_v2.py                       # Demo-Balken
-    python fem_interaktiv_v2.py bauteil.step --h 3    # STEP/IGES/STL/MSH
-    python fem_interaktiv_v2.py teil.stl --order 1 --E 70000 --nu 0.33
+    python fem_interaktiv_v2.py                       # Startdialog: Bauteil,
+                                                      # Material, Einheit, Netz
+    python fem_interaktiv_v2.py bauteil.step --h 3    # direkt per Kommandozeile
+    python fem_interaktiv_v2.py teil.stl --einheit m --material Titan
     python fem_interaktiv_v2.py --konsole             # Eingaben in der Konsole
                                                       # statt tkinter-Dialogen
-Einheiten: mm, N, MPa.
+Unterstuetzte Dateien: STEP/STP, IGES/IGS, BREP, STL, OBJ, PLY, VTK/VTP, MSH.
+Einheiten: mm, N, MPa (Dateien in cm, m oder inch werden beim Laden in mm
+umgerechnet; STEP/IGES bringen ihre Einheit selbst mit).
 
 Bedienung im 3D-Fenster
 -----------------------
@@ -34,10 +38,17 @@ Bedienung im 3D-Fenster
   7  Schnittmodus wechseln: keine -> Clip-Ebene -> Schnitt-Ebene
   8  Feld wechseln: von Mises -> Verschiebung -> Dichte (nach Optimierung)
   9  Export (ergebnis.vtu, bei Optimierung zusaetzlich optimiert.stl)
+  N  Netz anpassen: globale Groessen, Kruemmungsverfeinerung, lokale Verfeinerung
+     um die aktuelle Markierung (R+Rechteck, dann N), Neuvernetzung; Lager/Lasten
+     werden auf das neue Netz uebertragen
+  M  Materialdatenbank: Materialien anlegen/aendern/loeschen und auswaehlen
+     (gespeichert in materialien.json neben dem Skript)
   0  zurueck zur Lager-/Lastansicht
 """
 import argparse
+import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -48,6 +59,85 @@ from scipy.spatial import cKDTree
 import pyvista as pv
 
 USE_TK = True
+CAD_EXT = (".step", ".stp", ".iges", ".igs")
+SURF_EXT = (".stl", ".obj", ".ply", ".vtk", ".vtp")
+ALL_EXT = CAD_EXT + SURF_EXT + (".brep", ".msh")
+# Standard-Materialien (Richtwerte - bitte fuer die eigene Anwendung pruefen):
+# E [MPa], nu [-], rp = Streck-/Dehngrenze bzw. Festigkeit [MPa], rho [g/cm^3]
+DEFAULT_MATERIALS = {
+    "Baustahl S235":        dict(E=210000.0, nu=0.30, rp=235.0, rho=7.85),
+    "Edelstahl 1.4301":     dict(E=200000.0, nu=0.30, rp=190.0, rho=7.90),
+    "Aluminium EN AW-6061": dict(E=70000.0, nu=0.33, rp=240.0, rho=2.70),
+    "AlSi10Mg (3D-Druck)":  dict(E=70000.0, nu=0.33, rp=230.0, rho=2.67),
+    "Titan Ti-6Al-4V":      dict(E=110000.0, nu=0.34, rp=880.0, rho=4.43),
+    "Inconel 718":          dict(E=200000.0, nu=0.29, rp=1030.0, rho=8.19),
+    "Gusseisen GJL-250":    dict(E=110000.0, nu=0.26, rp=250.0, rho=7.15),
+    "Kupfer":               dict(E=120000.0, nu=0.34, rp=200.0, rho=8.96),
+}
+CUSTOM = "(Eigene Werte)"
+
+
+def db_path():
+    """Materialdatenbank: materialien.json neben dem Skript, sonst im Home-Verzeichnis."""
+    p = Path(__file__).resolve().with_name("materialien.json")
+    if p.exists() or os.access(p.parent, os.W_OK):
+        return p
+    return Path.home() / ".fem_materialien.json"
+
+
+def save_materials(db):
+    try:
+        with open(db_path(), "w", encoding="utf-8") as fh:
+            json.dump(db, fh, indent=2, ensure_ascii=False)
+    except OSError as e:
+        print(f"WARNUNG: Materialdatenbank konnte nicht gespeichert werden: {e}")
+
+
+def load_materials():
+    db = {}
+    p = db_path()
+    if p.exists():
+        try:
+            raw = json.load(open(p, encoding="utf-8"))
+            for name, v in raw.items():
+                E, nu = float(v["E"]), float(v["nu"])
+                if E > 0 and 0 <= nu < 0.5:
+                    db[str(name)] = dict(E=E, nu=nu,
+                                         rp=float(v["rp"]) if v.get("rp") else None,
+                                         rho=float(v["rho"]) if v.get("rho") else None)
+        except Exception as e:
+            bak = p.with_suffix(".defekt.json")
+            try:
+                p.replace(bak)
+            except OSError:
+                bak = p
+            print(f"WARNUNG: {p.name} nicht lesbar ({e}) - Standardwerte geladen, "
+                  f"defekte Datei gesichert als {bak.name}.")
+    if not db:
+        db = {k: dict(v) for k, v in DEFAULT_MATERIALS.items()}
+        save_materials(db)
+    return db
+
+
+def resolve_material(db, name, E, nu):
+    """Rueckgabe (Name oder None, E, nu) fuer Kommandozeilenangaben."""
+    if name:
+        match = [k for k in db if k.lower() == name.lower()] or \
+                [k for k in db if name.lower() in k.lower()]
+        if not match:
+            sys.exit(f"Material '{name}' nicht in der Datenbank ({db_path()}). "
+                     "Vorhanden: " + ", ".join(db))
+        v = db[match[0]]
+        return match[0], (E if E else v["E"]), (nu if nu is not None else v["nu"])
+    if E or nu is not None:
+        return None, (E or 210000.0), (nu if nu is not None else 0.3)
+    if db:
+        k = next(iter(db))
+        return k, db[k]["E"], db[k]["nu"]
+    return None, 210000.0, 0.3
+
+
+UNITS = {"mm": 1.0, "cm": 10.0, "m": 1000.0, "inch": 25.4}   # Faktor -> mm
 # Mittelknoten-Reihenfolge (VTK_QUADRATIC_TETRA): Kanten 0-1, 1-2, 2-0, 0-3, 1-3, 2-3
 EDGES = [(0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3)]
 CHUNK = 2000
@@ -75,10 +165,63 @@ def to_vtk_order(nodes, tets):
     return best
 
 
-def mesh_body(path, h=None, order=2):
-    """Tetraedernetz mit gmsh. Rueckgabe: nodes (n,3), tets (m,4|10)."""
-    import gmsh
+def prepare_surface(path):
+    """Liest ein Oberflaechennetz (STL/OBJ/PLY/VTK/VTP), bereinigt es, schliesst
+    kleine Loecher und schreibt es als temporaere STL-Datei."""
+    import tempfile
+    surf = pv.read(str(path))
+    if not isinstance(surf, pv.PolyData):
+        surf = surf.extract_surface()
+    surf = surf.triangulate().clean()
+    if surf.n_open_edges > 0:
+        print(f"Oberflaeche hat {surf.n_open_edges} offene Kanten - versuche Loecher zu schliessen ...")
+        surf = surf.fill_holes(hole_size=surf.length).triangulate().clean()
+    if surf.n_open_edges > 0:
+        sys.exit("FEHLER: Das Oberflaechennetz ist nicht geschlossen (kein Volumenkoerper). "
+                 "Bitte in der CAD-Software bzw. mit einem Mesh-Reparaturwerkzeug "
+                 "(z.B. MeshLab, Meshmixer) reparieren oder als STEP exportieren.")
+    try:
+        surf = surf.compute_normals(consistent_normals=True, auto_orient_normals=True,
+                                    split_vertices=False)
+    except Exception:
+        pass
+    out = Path(tempfile.mkdtemp()) / "surface.stl"
+    surf.save(str(out))
+    return str(out)
 
+
+_PREP_CACHE = {}
+
+
+def mesh_stats(nodes, tets):
+    """Kurzbericht ueber das Netz: Elementzahl, Kantenlaengen, schlechtestes Seitenverhaeltnis."""
+    X = nodes[tets[:, :4]]
+    L = np.stack([np.linalg.norm(X[:, i] - X[:, j], axis=1)
+                  for i, j in EDGES], axis=1)
+    asp = L.max(1) / L.min(1)
+    return (f"{len(tets)} Elemente, {len(nodes)} Knoten | Kantenlaenge min/mittel/max "
+            f"{L.min():.2f}/{L.mean():.2f}/{L.max():.2f} mm | Seitenverhaeltnis mittel/max "
+            f"{asp.mean():.1f}/{asp.max():.1f}")
+
+
+def mesh_body(path, h=None, order=2, scale=1.0, hmin=None, curv=12.0, refinements=None):
+    """Tetraedernetz mit gmsh. Groessen in mm, scale = Faktor Dateieinheit -> mm.
+    refinements: Liste von dict(lo=[x,y,z], hi=[x,y,z], size=mm, trans=mm) in mm.
+    Rueckgabe: nodes (n,3) in mm, tets (m,4|10), info dict(h, hmin).""" 
+    ext = Path(path).suffix.lower() if path else ""
+    if path is not None and ext not in ALL_EXT:
+        sys.exit(f"Dateityp {ext} nicht unterstuetzt. Erlaubt: " + ", ".join(ALL_EXT))
+    if ext in CAD_EXT or path is None:
+        scale = 1.0                              # STEP/IGES: Einheit wird von gmsh nach mm gewandelt
+    if ext in SURF_EXT:
+        key = (str(path), Path(path).stat().st_mtime)
+        if key not in _PREP_CACHE:                 # Aufbereitung nur einmal pro Datei
+            _PREP_CACHE[key] = prepare_surface(path)
+        path, ext = _PREP_CACHE[key], ".stl"
+    info = dict(h=None, hmin=None)
+    h_file = None if h is None else h / scale    # Elementgroesse in Dateieinheiten
+
+    import gmsh
     gmsh.initialize()
     gmsh.option.setNumber("General.Terminal", 0)
     try:
@@ -86,33 +229,62 @@ def mesh_body(path, h=None, order=2):
             gmsh.model.add("demo")
             gmsh.model.occ.addBox(0, 0, 0, 100, 20, 20)
             gmsh.model.occ.synchronize()
-        else:
-            ext = Path(path).suffix.lower()
-            if ext in (".step", ".stp", ".iges", ".igs", ".brep"):
-                gmsh.model.occ.importShapes(str(path))
-                gmsh.model.occ.synchronize()
-            elif ext == ".stl":
-                gmsh.merge(str(path))
-                gmsh.model.mesh.classifySurfaces(math.pi / 4, True, True)
-                gmsh.model.mesh.createGeometry()
-                surfs = [e[1] for e in gmsh.model.getEntities(2)]
-                loop = gmsh.model.geo.addSurfaceLoop(surfs)
-                gmsh.model.geo.addVolume([loop])
-                gmsh.model.geo.synchronize()
-            elif ext == ".msh":
-                gmsh.open(str(path))
-            else:
-                sys.exit(f"Dateityp {ext} nicht unterstuetzt.")
+        elif ext in CAD_EXT or ext == ".brep":
+            try:
+                gmsh.option.setString("Geometry.OCCTargetUnit", "MM")
+            except Exception:
+                pass
+            gmsh.model.occ.importShapes(str(path))
+            gmsh.model.occ.synchronize()
+        elif ext == ".stl":
+            gmsh.merge(str(path))
+            gmsh.model.mesh.classifySurfaces(math.pi / 4, True, True)
+            gmsh.model.mesh.createGeometry()
+            surfs = [e[1] for e in gmsh.model.getEntities(2)]
+            loop = gmsh.model.geo.addSurfaceLoop(surfs)
+            gmsh.model.geo.addVolume([loop])
+            gmsh.model.geo.synchronize()
+        elif ext == ".msh":
+            gmsh.open(str(path))
 
-        if h is None:
-            x0, y0, z0, x1, y1, z1 = gmsh.model.getBoundingBox(-1, -1)
-            h = math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2 + (z1 - z0) ** 2) / (
-                12 if order == 2 else 15)
-        gmsh.option.setNumber("Mesh.MeshSizeMax", h)
-        gmsh.option.setNumber("Mesh.MeshSizeMin", h / 4)
-        gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 12)
-        gmsh.option.setNumber("Mesh.ElementOrder", order)
-        gmsh.model.mesh.generate(3)
+        if ext == ".msh":                        # fertiges Volumennetz uebernehmen
+            if order == 2:
+                gmsh.model.mesh.setOrder(2)
+        else:
+            if h_file is None:
+                x0, y0, z0, x1, y1, z1 = gmsh.model.getBoundingBox(-1, -1)
+                h_file = math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2 + (z1 - z0) ** 2) / (
+                    12 if order == 2 else 15)
+            hmin_file = h_file / 4 if hmin is None else hmin / scale
+            refs = refinements or []
+            if refs:
+                hmin_file = min(hmin_file, min(r["size"] for r in refs) / scale)
+                fids = []
+                for r in refs:
+                    fid = gmsh.model.mesh.field.add("Box")
+                    lo, hi = np.asarray(r["lo"], float) / scale, np.asarray(r["hi"], float) / scale
+                    for nm, val in (("VIn", r["size"] / scale), ("VOut", h_file),
+                                    ("XMin", lo[0]), ("XMax", hi[0]), ("YMin", lo[1]),
+                                    ("YMax", hi[1]), ("ZMin", lo[2]), ("ZMax", hi[2]),
+                                    ("Thickness", r["trans"] / scale)):
+                        gmsh.model.mesh.field.setNumber(fid, nm, float(val))
+                    fids.append(fid)
+                bg = gmsh.model.mesh.field.add("Min")
+                gmsh.model.mesh.field.setNumbers(bg, "FieldsList", fids)
+                gmsh.model.mesh.field.setAsBackgroundMesh(bg)
+                gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+                gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
+            info = dict(h=h_file * scale, hmin=hmin_file * scale)
+            gmsh.option.setNumber("Mesh.MeshSizeMax", h_file)
+            gmsh.option.setNumber("Mesh.MeshSizeMin", hmin_file)
+            gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", float(curv))
+            gmsh.option.setNumber("Mesh.ElementOrder", order)
+            try:
+                gmsh.model.mesh.generate(3)
+            except Exception as e:
+                sys.exit(f"Vernetzung fehlgeschlagen: {e}\n"
+                         "Tipp: Elementgroesse (--h) anpassen; bei STL sicherstellen, "
+                         "dass der Koerper geschlossen ist.")
 
         ntags, coords, _ = gmsh.model.mesh.getNodes()
         coords = np.asarray(coords).reshape(-1, 3)
@@ -122,7 +294,8 @@ def mesh_body(path, h=None, order=2):
         etype, npe = (4, 4) if order == 1 else (11, 10)
         etypes, _, enodes = gmsh.model.mesh.getElements(3)
         if etype not in etypes:
-            sys.exit("Kein Tetraedernetz erzeugt (ist der Koerper geschlossen?).")
+            sys.exit("Kein Tetraedernetz in passender Ordnung erzeugt "
+                     "(ist der Koerper geschlossen / enthaelt die Datei Tetraeder?).")
         tets = np.asarray(enodes[list(etypes).index(etype)], dtype=np.int64)
         tets = lookup[tets.reshape(-1, npe)]
     finally:
@@ -131,10 +304,10 @@ def mesh_body(path, h=None, order=2):
     used = np.unique(tets)
     remap = np.full(len(coords), -1, dtype=np.int64)
     remap[used] = np.arange(len(used))
-    nodes, tets = coords[used], remap[tets]
+    nodes, tets = coords[used] * scale, remap[tets]
     if order == 2:
         tets = to_vtk_order(nodes, tets)
-    return nodes, tets
+    return nodes, tets, info
 
 
 # ==========================================================================
@@ -215,10 +388,23 @@ class FEM:
         self.ne = 3 * self.nen
         self.m = len(tets)
         self.ndof = 3 * len(nodes)
+        self.E, self.nu = E, nu
         self.D = elasticity_matrix(E, nu)
         self.edofs = (3 * tets[:, :, None] + np.arange(3)).reshape(self.m, self.ne)
         self.rows = self.cols = None
         self._element_stiffness()
+
+    def set_material(self, E, nu):
+        """Materialwechsel ohne Neuvernetzung."""
+        if abs(nu - self.nu) < 1e-12:
+            f = E / self.E
+            self.Ke0 *= f
+            self.D = self.D * f
+        else:
+            self.D = elasticity_matrix(E, nu)
+            self.E, self.nu = E, nu
+            self._element_stiffness()
+        self.E, self.nu = E, nu
 
     def _B(self, sl, L):
         Xe = self.nodes[self.tets[sl]]                          # (c,n,3)
@@ -528,6 +714,433 @@ def _topopt_console(defaults):
         return None
 
 
+def _ref_text(r):
+    return (f"Box x[{r['lo'][0]:.1f},{r['hi'][0]:.1f}] y[{r['lo'][1]:.1f},{r['hi'][1]:.1f}] "
+            f"z[{r['lo'][2]:.1f},{r['hi'][2]:.1f}]  h={r['size']:g}  Uebergang={r['trans']:g}")
+
+
+def make_refinement(sel_box, size, trans=None):
+    """Verfeinerungsbox um die markierten Knoten (mm). Rand = 1.5 x Elementgroesse."""
+    pad = 1.5 * size
+    return dict(lo=[float(v) for v in sel_box[0] - pad], hi=[float(v) for v in sel_box[1] + pad],
+                size=float(size), trans=float(trans if trans else 3 * size))
+
+
+def mesh_dialog(cfg, sel_box=None, n_sel=0):
+    """Netzeinstellungen: global und lokale Verfeinerungen (aus der aktuellen Markierung).
+    Rueckgabe: neue Einstellungen (dict) oder None."""
+    import tkinter as tk
+
+    root = tk.Tk()
+    root.title("Netz anpassen")
+    root.attributes("-topmost", True)
+    pad = dict(padx=8, pady=3)
+    out = {}
+    refs = [dict(r) for r in cfg["refs"]]
+    h0 = cfg.get("h")
+    v_h = tk.StringVar(value="" if h0 is None else f"{h0:.4g}")
+    v_hmin = tk.StringVar(value="" if cfg.get("hmin") is None else f"{cfg['hmin']:.4g}")
+    v_curv = tk.StringVar(value=f"{cfg.get('curv', 12):g}")
+    v_ord = tk.IntVar(value=cfg.get("order", 2))
+    v_size, v_trans = tk.StringVar(), tk.StringVar()
+
+    tk.Label(root, text="Globale Einstellungen", font=("TkDefaultFont", 10, "bold")
+             ).grid(row=0, column=0, columnspan=3, sticky="w", **pad)
+    rows = (("Max. Elementgroesse [mm]", v_h), ("Min. Elementgroesse [mm]", v_hmin),
+            ("Kruemmungsverfeinerung (Elemente je 360 Grad, 0 = aus)", v_curv))
+    for r, (lab, var) in enumerate(rows, start=1):
+        tk.Label(root, text=lab).grid(row=r, column=0, sticky="w", **pad)
+        tk.Entry(root, textvariable=var, width=10).grid(row=r, column=1, sticky="w", **pad)
+    tk.Label(root, text="Elementtyp").grid(row=4, column=0, sticky="w", **pad)
+    rf = tk.Frame(root)
+    rf.grid(row=4, column=1, sticky="w", **pad)
+    tk.Radiobutton(rf, text="Tet10", variable=v_ord, value=2).pack(side="left")
+    tk.Radiobutton(rf, text="Tet4", variable=v_ord, value=1).pack(side="left")
+
+    tk.Label(root, text="Lokale Verfeinerungen", font=("TkDefaultFont", 10, "bold")
+             ).grid(row=5, column=0, columnspan=3, sticky="w", **pad)
+    lb = tk.Listbox(root, height=6, width=78, exportselection=False)
+    lb.grid(row=6, column=0, columnspan=3, **pad)
+
+    def fill():
+        lb.delete(0, "end")
+        for r in refs:
+            lb.insert("end", _ref_text(r))
+
+    def remove():
+        for i in reversed(lb.curselection()):
+            del refs[i]
+        fill()
+
+    def remove_all():
+        refs.clear()
+        fill()
+
+    bf = tk.Frame(root)
+    bf.grid(row=7, column=0, columnspan=3, **pad)
+    tk.Button(bf, text="Auswahl entfernen", command=remove).pack(side="left", padx=3)
+    tk.Button(bf, text="Alle entfernen", command=remove_all).pack(side="left", padx=3)
+
+    err = tk.Label(root, text="", fg="red", wraplength=520, justify="left")
+
+    nf = tk.LabelFrame(root, text=("Neue Verfeinerung um die Markierung "
+                                   f"({n_sel} Knoten)" if sel_box is not None
+                                   else "Neue Verfeinerung: erst Flaeche mit R+Rechteck markieren"))
+    nf.grid(row=8, column=0, columnspan=3, sticky="ew", **pad)
+    tk.Label(nf, text="Elementgroesse [mm]").grid(row=0, column=0, **pad)
+    e1 = tk.Entry(nf, textvariable=v_size, width=8)
+    e1.grid(row=0, column=1, **pad)
+    tk.Label(nf, text="Uebergangsbereich [mm] (leer = 3 x h)").grid(row=0, column=2, **pad)
+    e2 = tk.Entry(nf, textvariable=v_trans, width=8)
+    e2.grid(row=0, column=3, **pad)
+
+    def add():
+        try:
+            size = float(v_size.get().replace(",", "."))
+            trans = float(v_trans.get().replace(",", ".")) if v_trans.get().strip() else None
+            assert size > 0 and (trans is None or trans > 0)
+        except Exception:
+            err.config(text="Bitte gueltige positive Zahlen eingeben.")
+            return
+        refs.append(make_refinement(sel_box, size, trans))
+        err.config(text="")
+        fill()
+
+    btn = tk.Button(nf, text="Hinzufuegen", command=add)
+    btn.grid(row=0, column=4, **pad)
+    if sel_box is None:
+        for w in (e1, e2, btn):
+            w.config(state="disabled")
+    err.grid(row=9, column=0, columnspan=3)
+
+    def ok():
+        try:
+            h = float(v_h.get().replace(",", "."))
+            hmin = float(v_hmin.get().replace(",", ".")) if v_hmin.get().strip() else None
+            curv = float(v_curv.get().replace(",", "."))
+            assert h > 0 and curv >= 0 and (hmin is None or 0 < hmin <= h)
+        except Exception:
+            err.config(text="Ungueltige Eingabe (h > 0, 0 < hmin <= h, Kruemmung >= 0).")
+            return
+        out["r"] = dict(h=h, hmin=hmin, curv=curv, order=v_ord.get(), refs=refs)
+        root.destroy()
+
+    bb = tk.Frame(root)
+    bb.grid(row=10, column=0, columnspan=3, pady=8)
+    tk.Button(bb, text="Neu vernetzen", command=ok).pack(side="left", padx=6)
+    tk.Button(bb, text="Abbrechen", command=root.destroy).pack(side="left", padx=6)
+    fill()
+    root.mainloop()
+    return out.get("r")
+
+
+def mesh_console(cfg, sel_box=None, n_sel=0):
+    """Konsolenvariante von mesh_dialog."""
+    def ask(prompt, default, conv=float):
+        t = input(f"{prompt} [{default}]: ").strip()
+        return conv(t.replace(",", ".")) if t else default
+
+    try:
+        h = ask("Max. Elementgroesse [mm]", cfg.get("h") or 5.0)
+        hmin = ask("Min. Elementgroesse [mm]", cfg.get("hmin") or h / 4)
+        curv = ask("Kruemmungsverfeinerung (0 = aus)", cfg.get("curv", 12.0))
+        order = ask("Elementtyp (1 = Tet4, 2 = Tet10)", cfg.get("order", 2), int)
+        refs = [dict(r) for r in cfg["refs"]]
+        if refs and input(f"{len(refs)} Verfeinerung(en) vorhanden - alle entfernen? [j/N]: "
+                          ).strip().lower() == "j":
+            refs = []
+        if sel_box is not None:
+            size = input(f"Verfeinerung um die Markierung ({n_sel} Knoten): Elementgroesse "
+                         "[mm] (Enter = keine): ").strip()
+            if size:
+                refs.append(make_refinement(sel_box, float(size.replace(",", "."))))
+        if h <= 0 or hmin <= 0 or hmin > h or order not in (1, 2):
+            raise ValueError
+        return dict(h=h, hmin=hmin, curv=curv, order=order, refs=refs)
+    except ValueError:
+        print("Ungueltige Eingabe.")
+        return None
+
+
+# ==========================================================================
+# Startdialog
+# ==========================================================================
+def material_dialog(db, current=None, parent=None):
+    """Materialdatenbank bearbeiten (neu, aendern, loeschen) und auswaehlen.
+    Aenderungen werden sofort in materialien.json gespeichert.
+    Rueckgabe: Name des uebernommenen Materials oder None."""
+    import tkinter as tk
+    from tkinter import messagebox
+
+    own = parent is None
+    win = tk.Tk() if own else tk.Toplevel(parent)
+    win.title("Materialdatenbank")
+    win.attributes("-topmost", True)
+    pad = dict(padx=6, pady=3)
+    out = {}
+
+    lb = tk.Listbox(win, height=13, width=28, exportselection=False)
+    lb.grid(row=0, column=0, rowspan=8, **pad)
+    fields = [("Name", tk.StringVar()), ("E-Modul [MPa]", tk.StringVar()),
+              ("Querkontraktion nu", tk.StringVar()),
+              ("Streckgrenze/Festigkeit Rp [MPa] (optional)", tk.StringVar()),
+              ("Dichte [g/cm3] (optional)", tk.StringVar())]
+    for r, (lab, var) in enumerate(fields):
+        tk.Label(win, text=lab).grid(row=r, column=1, sticky="w", **pad)
+        tk.Entry(win, textvariable=var, width=22).grid(row=r, column=2, **pad)
+    err = tk.Label(win, text="", fg="red", wraplength=330, justify="left")
+    err.grid(row=5, column=1, columnspan=2)
+
+    def refresh(sel=None):
+        lb.delete(0, "end")
+        for n in db:
+            lb.insert("end", n)
+        if sel in db:
+            i = list(db).index(sel)
+            lb.selection_clear(0, "end")
+            lb.selection_set(i)
+            lb.see(i)
+
+    def fill(name):
+        v = db[name]
+        vals = [name, f"{v['E']:g}", f"{v['nu']:g}",
+                "" if not v.get("rp") else f"{v['rp']:g}",
+                "" if not v.get("rho") else f"{v['rho']:g}"]
+        for (_, var), t in zip(fields, vals):
+            var.set(t)
+
+    def on_select(_=None):
+        sel = lb.curselection()
+        if sel:
+            fill(lb.get(sel[0]))
+            err.config(text="")
+
+    lb.bind("<<ListboxSelect>>", on_select)
+
+    def parse():
+        name = fields[0][1].get().strip()
+        if not name:
+            raise ValueError("Bitte einen Namen eingeben.")
+        num = lambda i: float(fields[i][1].get().replace(",", ".").strip())
+        try:
+            E, nu = num(1), num(2)
+            rp = num(3) if fields[3][1].get().strip() else None
+            rho = num(4) if fields[4][1].get().strip() else None
+        except ValueError:
+            raise ValueError("Bitte gueltige Zahlen eingeben.")
+        if E <= 0 or not (0 <= nu < 0.5):
+            raise ValueError("E > 0 und 0 <= nu < 0.5 erforderlich.")
+        if (rp is not None and rp <= 0) or (rho is not None and rho <= 0):
+            raise ValueError("Rp und Dichte muessen positiv sein.")
+        return name, dict(E=E, nu=nu, rp=rp, rho=rho)
+
+    def save():
+        try:
+            name, v = parse()
+        except ValueError as e:
+            err.config(text=str(e))
+            return None
+        db[name] = v
+        save_materials(db)
+        refresh(name)
+        err.config(text=f"'{name}' gespeichert.", fg="darkgreen")
+        return name
+
+    def new():
+        for _, var in fields:
+            var.set("")
+        lb.selection_clear(0, "end")
+        err.config(text="Neues Material: Werte eintragen und 'Speichern'.", fg="black")
+
+    def delete():
+        sel = lb.curselection()
+        if not sel:
+            return
+        name = lb.get(sel[0])
+        if messagebox.askyesno("Loeschen", f"'{name}' aus der Datenbank loeschen?", parent=win):
+            del db[name]
+            save_materials(db)
+            refresh()
+            for _, var in fields:
+                var.set("")
+
+    def use():
+        err.config(fg="red")
+        name = save()
+        if name:
+            out["r"] = name
+            win.destroy()
+
+    bf = tk.Frame(win)
+    bf.grid(row=8, column=1, columnspan=2, pady=8)
+    for txt, cmd in (("Neu", new), ("Speichern", save), ("Loeschen", delete),
+                     ("Uebernehmen", use), ("Schliessen", win.destroy)):
+        tk.Button(bf, text=txt, command=cmd, width=10).pack(side="left", padx=2)
+
+    refresh(current)
+    if current in db:
+        fill(current)
+    if own:
+        win.mainloop()
+    else:
+        win.grab_set()
+        win.wait_window()
+    return out.get("r")
+
+
+def material_console(db):
+    """Konsolenvariante der Materialdatenbank. Rueckgabe: Name oder None."""
+    while True:
+        names = list(db)
+        for i, n in enumerate(names, 1):
+            v = db[n]
+            print(f"  {i}: {n}  E={v['E']:g} MPa  nu={v['nu']:g}"
+                  + (f"  Rp={v['rp']:g}" if v.get("rp") else "")
+                  + (f"  rho={v['rho']:g}" if v.get("rho") else ""))
+        c = input("Nummer waehlen, n = neu, d = loeschen, Enter = abbrechen: ").strip().lower()
+        if not c:
+            return None
+        if c.isdigit() and 1 <= int(c) <= len(names):
+            return names[int(c) - 1]
+        try:
+            if c == "n":
+                name = input("Name: ").strip()
+                E = float(input("E-Modul [MPa]: ").replace(",", "."))
+                nu = float(input("Querkontraktion nu: ").replace(",", "."))
+                rp = input("Rp [MPa] (optional): ").strip()
+                rho = input("Dichte [g/cm3] (optional): ").strip()
+                if name and E > 0 and 0 <= nu < 0.5:
+                    db[name] = dict(E=E, nu=nu, rp=float(rp) if rp else None,
+                                    rho=float(rho) if rho else None)
+                    save_materials(db)
+            elif c == "d":
+                k = int(input("Nummer loeschen: "))
+                del db[names[k - 1]]
+                save_materials(db)
+        except (ValueError, IndexError, KeyError):
+            print("Ungueltige Eingabe.")
+
+
+def ask_startup(cfg, db):
+    """tkinter-Startdialog: Bauteil, Einheit, Material, Elementtyp, Netzgroesse.
+    Rueckgabe: dict oder None (Abbruch)."""
+    import tkinter as tk
+    from tkinter import filedialog, ttk
+
+    root = tk.Tk()
+    root.title("FEM - Bauteil laden")
+    root.attributes("-topmost", True)
+    out = {}
+    pad = dict(padx=8, pady=4)
+
+    path_v = tk.StringVar(value=cfg.get("path") or "")
+    unit_v = tk.StringVar(value=cfg.get("unit", "mm"))
+    mat_v = tk.StringVar(value=cfg.get("material") or (next(iter(db)) if db else CUSTOM))
+    E_v, nu_v = tk.StringVar(), tk.StringVar()
+    ord_v = tk.IntVar(value=cfg.get("order", 2))
+    h_v = tk.StringVar(value="" if cfg.get("h") is None else f"{cfg['h']:g}")
+
+    tk.Label(root, text="Bauteil (leer = Demo-Balken):").grid(row=0, column=0, sticky="w", **pad)
+    tk.Entry(root, textvariable=path_v, width=48).grid(row=0, column=1, **pad)
+
+    def browse():
+        p = filedialog.askopenfilename(
+            parent=root, title="Bauteil auswaehlen",
+            filetypes=[("3D-Geometrie", " ".join("*" + e for e in ALL_EXT)),
+                       ("Alle Dateien", "*.*")])
+        if p:
+            path_v.set(p)
+
+    tk.Button(root, text="Durchsuchen ...", command=browse).grid(row=0, column=2, **pad)
+
+    tk.Label(root, text="Einheit der Datei (STL/OBJ/...):").grid(row=1, column=0, sticky="w", **pad)
+    ttk.Combobox(root, textvariable=unit_v, values=list(UNITS), width=8,
+                 state="readonly").grid(row=1, column=1, sticky="w", **pad)
+
+    tk.Label(root, text="Material:").grid(row=2, column=0, sticky="w", **pad)
+    mf = tk.Frame(root)
+    mf.grid(row=2, column=1, sticky="w", **pad)
+    cb = ttk.Combobox(mf, textvariable=mat_v, width=26, state="readonly")
+    cb.pack(side="left")
+    ent = {}
+
+    def on_mat(_=None):
+        v = db.get(mat_v.get())
+        if v:
+            E_v.set(f"{v['E']:g}")
+            nu_v.set(f"{v['nu']:g}")
+        state = "normal" if mat_v.get() == CUSTOM else "disabled"
+        for e in ent.values():
+            e.config(state=state)
+
+    def refresh_list():
+        cb["values"] = list(db) + [CUSTOM]
+        if mat_v.get() not in db and mat_v.get() != CUSTOM:
+            mat_v.set(next(iter(db)) if db else CUSTOM)
+        on_mat()
+
+    def edit_db():
+        n = material_dialog(db, mat_v.get(), parent=root)
+        if n:
+            mat_v.set(n)
+        refresh_list()
+
+    tk.Button(mf, text="Datenbank ...", command=edit_db).pack(side="left", padx=6)
+    cb.bind("<<ComboboxSelected>>", on_mat)
+
+    tk.Label(root, text="E-Modul [MPa]:").grid(row=3, column=0, sticky="w", **pad)
+    ent["E"] = tk.Entry(root, textvariable=E_v, width=12)
+    ent["E"].grid(row=3, column=1, sticky="w", **pad)
+    tk.Label(root, text="Querkontraktionszahl:").grid(row=4, column=0, sticky="w", **pad)
+    ent["nu"] = tk.Entry(root, textvariable=nu_v, width=12)
+    ent["nu"].grid(row=4, column=1, sticky="w", **pad)
+    if cfg.get("E") and not cfg.get("material"):
+        mat_v.set(CUSTOM)
+        E_v.set(f"{cfg['E']:g}")
+        nu_v.set(f"{cfg.get('nu', 0.3):g}")
+    refresh_list()
+
+    tk.Label(root, text="Elementtyp:").grid(row=5, column=0, sticky="w", **pad)
+    rf = tk.Frame(root)
+    rf.grid(row=5, column=1, sticky="w", **pad)
+    tk.Radiobutton(rf, text="Tet10 (genau)", variable=ord_v, value=2).pack(side="left")
+    tk.Radiobutton(rf, text="Tet4 (schnell)", variable=ord_v, value=1).pack(side="left")
+
+    tk.Label(root, text="Elementgroesse [mm] (leer = automatisch):").grid(
+        row=6, column=0, sticky="w", **pad)
+    tk.Entry(root, textvariable=h_v, width=12).grid(row=6, column=1, sticky="w", **pad)
+
+    err = tk.Label(root, text="", fg="red")
+    err.grid(row=7, column=0, columnspan=3)
+
+    def ok():
+        try:
+            E = float(E_v.get().replace(",", "."))
+            nu = float(nu_v.get().replace(",", "."))
+            h = float(h_v.get().replace(",", ".")) if h_v.get().strip() else None
+        except ValueError:
+            err.config(text="Bitte gueltige Zahlen eingeben.")
+            return
+        if E <= 0 or not (0.0 <= nu < 0.5) or (h is not None and h <= 0):
+            err.config(text="E > 0, 0 <= nu < 0.5 und h > 0 erforderlich.")
+            return
+        p = path_v.get().strip()
+        if p and not Path(p).is_file():
+            err.config(text="Datei nicht gefunden.")
+            return
+        out["r"] = dict(path=p or None, unit=unit_v.get(), E=E, nu=nu,
+                        material=None if mat_v.get() == CUSTOM else mat_v.get(),
+                        order=ord_v.get(), h=h)
+        root.destroy()
+
+    bf = tk.Frame(root)
+    bf.grid(row=8, column=0, columnspan=3, pady=8)
+    tk.Button(bf, text="Vernetzen und starten", command=ok).pack(side="left", padx=6)
+    tk.Button(bf, text="Abbrechen", command=root.destroy).pack(side="left", padx=6)
+    root.mainloop()
+    return out.get("r")
+
+
 # ==========================================================================
 # Interaktive Oberflaeche
 # ==========================================================================
@@ -535,10 +1148,51 @@ class App:
     CUTS = ["keine", "Clip-Ebene", "Schnitt-Ebene"]
     BAR_TITLES = ["von Mises [MPa]", "u [mm]", "Dichte"]
 
-    def __init__(self, nodes, tets, E, nu):
+    def __init__(self, nodes, tets, E, nu, title="Interaktive FEM", db=None, mat_name=None,
+                 src=None, mesh_cfg=None):
+        self.src = src or dict(path=None, scale=1.0)
+        self.mesh_cfg = mesh_cfg or dict(h=None, hmin=None, curv=12.0,
+                                         order=1 if tets.shape[1] == 4 else 2, refs=[])
+        self.db = db if db is not None else {}
+        self.mat_name = mat_name
+        base = self.db.get(mat_name, {})
+        self.props = dict(E=E, nu=nu, rp=base.get("rp"), rho=base.get("rho"))
+        self._setup_mesh(nodes, tets)
+
+        self.selection = np.array([], dtype=int)
+        self.history = []        # ("support", ids, mask, vals) | ("force", ids, F)
+        self._marker_names = []
+        self.mode = "setup"
+        self.busy = False
+        self.stop = False
+        self.res = None
+        self.cut_i = 0
+        self.field_i = 0
+        self.thr = 0.5
+
+        self.pl = pv.Plotter(title=title)
+        self.pl.add_mesh(self.surf, color="lightsteelblue", show_edges=True,
+                         edge_color="gray", line_width=0.5, name="body")
+        self.pl.add_axes()
+        self._enable_picking()
+        for key, fn in (("1", self.assign_support), ("2", self.assign_force),
+                        ("3", self.undo), ("4", self.clear), ("5", self.run),
+                        ("6", self.run_topopt), ("7", self.next_cut),
+                        ("8", self.next_field), ("9", self.export), ("m", self.choose_material), ("n", self.adjust_mesh),
+                        ("0", self.back)):
+            self.pl.add_key_event(key, fn)
+        self.pl.add_text("R+Rechteck: markieren | 1 Lager | 2 Kraft | 3 Undo | 4 Loeschen | "
+                         "5 Rechnen | 6 Topologieopt. | M Material | N Netz", position="upper_left",
+                         font_size=8, name="help")
+        self.update_matinfo()
+        self.status(f"{self.nn} Knoten, {len(tets)} Tet{'10' if self.order == 2 else '4'}. "
+                    "Mit R und Rechteck Oberflaeche markieren.")
+
+    def _setup_mesh(self, nodes, tets):
+        """Alle vom Netz abhaengigen Datenstrukturen (neu) aufbauen."""
         self.nodes, self.tets = nodes, tets
         self.nn = len(nodes)
-        self.fem = FEM(nodes, tets, E, nu)
+        self.fem = FEM(nodes, tets, self.props["E"], self.props["nu"])
         self.order = self.fem.order
         t4 = tets[:, :4]
         self.corner_ids = np.unique(t4)
@@ -554,35 +1208,129 @@ class App:
             np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), axis=1)
         self.diag = float(np.linalg.norm(np.ptp(nodes, axis=0)))
         self._edge_maps()
+        self.surf_corner = np.unique(self.tri)
 
-        self.selection = np.array([], dtype=int)
-        self.history = []        # ("support", ids, mask, vals) | ("force", ids, F)
-        self._marker_names = []
-        self.mode = "setup"
-        self.busy = False
-        self.stop = False
+    def _enable_picking(self):
+        try:
+            self.pl.disable_picking()
+        except Exception:
+            pass
+        self.pl.enable_cell_picking(mesh=self.surf, callback=self.on_pick, through=False,
+                                    show=False, show_message=False)
+
+    # ---- Netz anpassen ----
+    def adjust_mesh(self):
+        if self.busy:
+            return
+        p = self.src.get("path")
+        if p and Path(p).suffix.lower() == ".msh":
+            return self.status("Fertige MSH-Volumennetze koennen nicht neu vernetzt werden.")
+        if self.mode == "result":
+            self.back()
+        sel_box = None
+        if len(self.selection):
+            pts = self.nodes[self.selection]
+            sel_box = (pts.min(0), pts.max(0))
+        cfg = None
+        try:
+            cfg = (mesh_dialog if USE_TK else mesh_console)(self.mesh_cfg, sel_box, len(self.selection))
+        except Exception as e:
+            print(f"Dialog nicht verfuegbar ({e}) - Konsole.")
+            cfg = mesh_console(self.mesh_cfg, sel_box, len(self.selection))
+        if cfg is None:
+            return self.status("Netz unveraendert.")
+        self.apply_mesh(cfg)
+
+    def apply_mesh(self, cfg):
+        """Neu vernetzen; Lager und Lasten werden auf das neue Netz uebertragen."""
+        self.busy = True
+        self.status("Vernetze neu ... (kann etwas dauern)")
+        try:
+            nodes, tets, info = mesh_body(self.src.get("path"), cfg["h"], cfg["order"],
+                                          self.src.get("scale", 1.0), cfg["hmin"],
+                                          cfg["curv"], cfg["refs"])
+        except SystemExit as e:
+            self.busy = False
+            return self.status(f"Vernetzung fehlgeschlagen: {e}")
+        except Exception as e:
+            self.busy = False
+            return self.status(f"Vernetzung fehlgeschlagen: {e}")
+
+        # Zuordnung alter -> neuer Oberflaechenknoten (naechster alter Knoten)
+        old_corner, old_nodes, old_hist = self.surf_corner, self.nodes, self.history
+        tree = cKDTree(old_nodes[old_corner])
+        self._setup_mesh(nodes, tets)
+        _, nearest = tree.query(self.nodes[self.surf_corner])
+        new_hist, dropped = [], 0
+        for h in old_hist:
+            keep = np.isin(old_corner, h[1])[nearest]
+            if not keep.any():
+                dropped += 1
+                continue
+            new_hist.append((h[0], self.expand_selection(self.surf_corner[keep])) + tuple(h[2:]))
+        self.history = new_hist
+        self.mesh_cfg = dict(h=info["h"] or cfg["h"], hmin=info["hmin"] or cfg["hmin"],
+                             curv=cfg["curv"], order=cfg["order"], refs=cfg["refs"])
         self.res = None
-        self.cut_i = 0
-        self.field_i = 0
-        self.thr = 0.5
-
-        self.pl = pv.Plotter(title="Interaktive FEM")
+        self.selection = np.array([], dtype=int)
+        self.pl.remove_actor("body")
         self.pl.add_mesh(self.surf, color="lightsteelblue", show_edges=True,
                          edge_color="gray", line_width=0.5, name="body")
-        self.pl.add_axes()
-        self.pl.enable_cell_picking(callback=self.on_pick, through=False,
-                                    show=False, show_message=False)
-        for key, fn in (("1", self.assign_support), ("2", self.assign_force),
-                        ("3", self.undo), ("4", self.clear), ("5", self.run),
-                        ("6", self.run_topopt), ("7", self.next_cut),
-                        ("8", self.next_field), ("9", self.export),
-                        ("0", self.back)):
-            self.pl.add_key_event(key, fn)
-        self.pl.add_text("R+Rechteck: markieren | 1 Lager | 2 Kraft | 3 Undo | 4 Loeschen | "
-                         "5 Rechnen | 6 Topologieopt.", position="upper_left",
-                         font_size=8, name="help")
-        self.status(f"{self.nn} Knoten, {len(tets)} Tet{'10' if self.order == 2 else '4'}. "
-                    "Mit R und Rechteck Oberflaeche markieren.")
+        self._enable_picking()
+        self.busy = False
+        self.redraw()
+        self.update_matinfo()
+        msg = mesh_stats(nodes, tets)
+        if dropped:
+            msg += f" | {dropped} Zuweisung(en) nicht uebertragbar"
+        if len(tets) > 60000:
+            msg += " | WARNUNG: sehr gross"
+        self.status(msg)
+
+    # ---- Material ----
+    def mass_g(self, rho_el=None):
+        d = self.props.get("rho")
+        if not d:
+            return None
+        v = self.fem.vol.sum() if rho_el is None else (self.fem.vol * rho_el).sum()
+        return v * d * 1e-3                      # mm^3 * g/cm^3 -> g
+
+    def update_matinfo(self):
+        p = self.props
+        txt = f"Material: {self.mat_name or 'eigene Werte'}\nE = {p['E']:g} MPa, nu = {p['nu']:g}"
+        if p.get("rp"):
+            txt += f", Rp = {p['rp']:g} MPa"
+        m = self.mass_g()
+        if m is not None:
+            txt += f"\nMasse: {m:.1f} g"
+        self.pl.add_text(txt, position="upper_right", font_size=8, name="matinfo")
+
+    def choose_material(self):
+        if self.busy:
+            return
+        if self.mode == "result":
+            self.back()
+        name = None
+        try:
+            if USE_TK:
+                name = material_dialog(self.db, self.mat_name)
+            else:
+                name = material_console(self.db)
+        except Exception as e:
+            print(f"Dialog nicht verfuegbar ({e}) - Konsole.")
+            name = material_console(self.db)
+        name = name or self.mat_name           # evtl. geaenderte Werte des aktuellen Materials
+        if name not in self.db:
+            return self.status("Material unveraendert.")
+        v = self.db[name]
+        changed = (abs(v["E"] - self.fem.E) > 1e-9 or abs(v["nu"] - self.fem.nu) > 1e-12)
+        if changed:
+            self.fem.set_material(v["E"], v["nu"])
+            self.res = None
+        self.mat_name = name
+        self.props = dict(E=v["E"], nu=v["nu"], rp=v.get("rp"), rho=v.get("rho"))
+        self.update_matinfo()
+        self.status(f"Material: {name}" + (" (Berechnung neu starten mit 5)" if changed else ""))
 
     # ---- Netz-Topologie fuer Auswahl / Lastverteilung ----
     def _edge_maps(self):
@@ -672,6 +1420,13 @@ class App:
                 name = f"mark{i}"
                 self.pl.add_arrows(c - d * 0.15 * self.diag, d * 0.15 * self.diag,
                                    color="green", name=name, mag=1.0)
+            self._marker_names.append(name)
+        for i, r in enumerate(self.mesh_cfg["refs"]):
+            lo, hi = r["lo"], r["hi"]
+            name = f"mark_ref{i}"
+            self.pl.add_mesh(pv.Box(bounds=(lo[0], hi[0], lo[1], hi[1], lo[2], hi[2])),
+                             style="wireframe", color="magenta", line_width=1.5,
+                             name=name, reset_camera=False)
             self._marker_names.append(name)
         self.selection = np.array([], dtype=int)
         self.pl.render()
@@ -910,8 +1665,15 @@ class App:
         pl.render()
         extra = ""
         if self.res["rho"] is None:
-            extra = (f"max von Mises {self.res['vm'][self.corner_ids].max():.2f} MPa, "
+            vmax = self.res["vm"][self.corner_ids].max()
+            extra = (f"max von Mises {vmax:.2f} MPa, "
                      f"max u {np.linalg.norm(self.res['u'], axis=1).max():.4f} mm, ")
+            if self.props.get("rp") and vmax > 0:
+                extra += f"Sicherheit Rp/vM {self.props['rp'] / vmax:.2f} (Spitzenwert), "
+        else:
+            m, m0 = self.mass_g(self.res["rho"]), self.mass_g()
+            if m is not None:
+                extra = f"Masse {m:.1f} g (vorher {m0:.1f} g), "
         self.status(f"{field} | Schnitt: {cut} | {extra}{self.scale:.1f}x ueberhoeht | "
                     "7 Schnitt, 8 Feld, 9 Export, 0 zurueck")
 
@@ -968,21 +1730,56 @@ class App:
 def main():
     global USE_TK
     ap = argparse.ArgumentParser(description="Interaktive lineare FEM + Topologieoptimierung")
-    ap.add_argument("datei", nargs="?", help="STEP/IGES/STL/MSH (leer = Demo-Balken)")
+    ap.add_argument("datei", nargs="?",
+                    help="Bauteil: " + "/".join(e[1:] for e in ALL_EXT) + " (leer = Startdialog)")
     ap.add_argument("--h", type=float, default=None, help="Elementgroesse in mm")
+    ap.add_argument("--hmin", type=float, default=None,
+                    help="Minimale Elementgroesse in mm (Standard: h/4)")
+    ap.add_argument("--kruemmung", type=float, default=12.0,
+                    help="Kruemmungsverfeinerung: Elemente je 360 Grad (0 = aus)")
     ap.add_argument("--order", type=int, choices=(1, 2), default=2,
                     help="1 = Tet4, 2 = Tet10 (Standard)")
-    ap.add_argument("--E", type=float, default=210000.0, help="E-Modul in MPa")
-    ap.add_argument("--nu", type=float, default=0.3, help="Querkontraktionszahl")
+    ap.add_argument("--material", default=None,
+                    help="Name (oder Teil davon) aus der Materialdatenbank materialien.json")
+    ap.add_argument("--E", type=float, default=None, help="E-Modul in MPa (ueberschreibt Material)")
+    ap.add_argument("--nu", type=float, default=None, help="Querkontraktionszahl (ueberschreibt Material)")
+    ap.add_argument("--einheit", choices=list(UNITS), default="mm",
+                    help="Laengeneinheit der Datei (STL/OBJ/...; STEP/IGES automatisch)")
     ap.add_argument("--konsole", action="store_true",
                     help="Eingaben in der Konsole statt in tkinter-Dialogen")
     args = ap.parse_args()
     USE_TK = not args.konsole
 
-    print("Vernetze ...")
-    nodes, tets = mesh_body(args.datei, args.h, args.order)
-    print(f"{len(nodes)} Knoten, {len(tets)} Tetraeder (Ordnung {args.order})")
-    App(nodes, tets, args.E, args.nu).show()
+    db = load_materials()
+    mname, E, nu = resolve_material(db, args.material, args.E, args.nu)
+    cfg = dict(path=args.datei, h=args.h, order=args.order, E=E, nu=nu,
+               unit=args.einheit, material=mname)
+    if args.datei is None and USE_TK and len(sys.argv) == 1:
+        try:
+            cfg = ask_startup(cfg, db)
+        except Exception as e:
+            print(f"Startdialog nicht verfuegbar ({e}) - Demo-Balken.")
+        if cfg is None:
+            return
+
+    title = Path(cfg["path"]).name if cfg["path"] else "Demo-Balken"
+    print(f"Vernetze {title} ...")
+    nodes, tets, info = mesh_body(cfg["path"], cfg["h"], cfg["order"], UNITS[cfg["unit"]],
+                                  args.hmin, args.kruemmung)
+    size = np.ptp(nodes, axis=0)
+    print(f"{len(nodes)} Knoten, {len(tets)} Tetraeder (Ordnung {cfg['order']}); "
+          f"Abmessungen {size[0]:.1f} x {size[1]:.1f} x {size[2]:.1f} mm")
+    if size.max() < 1.0 or size.max() > 20000:
+        print("WARNUNG: Ungewoehnliche Bauteilgroesse - stimmt die Einheit der Datei?")
+    if len(tets) > 60000:
+        print("WARNUNG: Sehr grosses Netz - Rechenzeit und Speicherbedarf beachten "
+              "(groessere --h oder --order 1 waehlen).")
+    print(mesh_stats(nodes, tets))
+    mesh_cfg = dict(h=info["h"], hmin=info["hmin"], curv=args.kruemmung,
+                    order=cfg["order"], refs=[])
+    src = dict(path=cfg["path"], scale=UNITS[cfg["unit"]])
+    App(nodes, tets, cfg["E"], cfg["nu"], title=f"FEM - {title}",
+        db=db, mat_name=cfg.get("material"), src=src, mesh_cfg=mesh_cfg).show()
 
 
 if __name__ == "__main__":
