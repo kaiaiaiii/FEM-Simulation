@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 fem_gui.py - Interaktive FEM mit Grafikfenster (Qt + PyVista)
 =============================================================
@@ -21,8 +22,31 @@ Ablauf im Fenster
 7. Datei > Setup speichern (fuer Server) ...   ->  Berechnung ohne Grafik:
        python fem_core.py run setup.json
 """
+import os
 import sys
 from pathlib import Path
+
+
+def _prefer_bundled_qt5():
+    """Linux: Das PyQt5-Wheel bringt eigene Qt-Bibliotheken mit. Ist daneben ein anderes Qt 5
+    im System installiert, laedt das xcb-Plugin manchmal dessen Bibliotheken und scheitert
+    ("undefined symbol ... Qt_5_PRIVATE_API"). Dann wird einmalig mit passendem
+    LD_LIBRARY_PATH neu gestartet. Abschalten: FEM_NO_QT_FIX=1."""
+    if (not sys.platform.startswith("linux") or os.environ.get("FEM_QT_REEXEC")
+            or os.environ.get("FEM_NO_QT_FIX") or os.environ.get("QT_API", "pyqt5").lower() != "pyqt5"):
+        return
+    import importlib.util
+    spec = importlib.util.find_spec("PyQt5")
+    if spec is None or not spec.origin:
+        return
+    lib = Path(spec.origin).parent / "Qt5" / "lib"
+    if lib.is_dir():
+        env = dict(os.environ, FEM_QT_REEXEC="1")
+        env["LD_LIBRARY_PATH"] = f"{lib}:{env['LD_LIBRARY_PATH']}" if env.get("LD_LIBRARY_PATH") else str(lib)
+        os.execve(sys.executable, [sys.executable] + sys.argv, env)
+
+
+_prefer_bundled_qt5()
 
 import numpy as np
 from qtpy import QtCore as QC
