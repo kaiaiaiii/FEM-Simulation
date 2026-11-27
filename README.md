@@ -29,5 +29,6 @@ The list gets changed on and on, and I am open for any ideas:
 1. parallelisation
 2. shift to cpp?
 3. language
+4. start with a own desktop item, not in cmd
 
 
