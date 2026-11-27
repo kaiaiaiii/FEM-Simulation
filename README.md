@@ -17,6 +17,7 @@ The list gets changed on and on, and I am open for any ideas:
 1. nonlinear properties
 2. contact models
 3. dynamics, electrodynamics etc
+4. Topologieoptimierung andere kriterien
 99. CFD flow/interface to OPENFoam
 
 ### postprocessing
@@ -24,7 +25,7 @@ The list gets changed on and on, and I am open for any ideas:
 2. more exports, like displacement
 3. other hypothesis
 
-### performace/QOL
+### performance/QOL
 1. parallelisation
 2. shift to cpp?
 3. language

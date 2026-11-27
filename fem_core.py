@@ -23,7 +23,8 @@ mesh.*              h, hmin, curv, order (1|2), refinements, file (gespeichertes
 material            name, E [MPa], nu, rp [MPa], rho [g/cm^3]
 supports[]          Lager:  mask [x,y,z], values [mm] und eine Knotenauswahl (siehe unten)
 loads[]             Lasten: force [Fx,Fy,Fz] in N, flaechengewichtet verteilt
-analysis.type       "static" oder "topopt" (Parameter in analysis.topopt)
+analysis.type       "static" oder "topopt" (Parameter in analysis.topopt; mit save_dir werden
+                    Zwischenergebnisse je save_every Iterationen als VTK + verlauf.csv gespeichert)
 output.file         Ergebnisdatei (.vtk oder .vtu)
 
 Knotenauswahl einer Randbedingung (eine der Varianten):
@@ -614,7 +615,7 @@ class FEM:
             rt_new = Hn @ rho
             rt_new[passive] = 1.0
             vfrac = float((vol * rt_new).sum() / vol.sum())
-            stop = callback(it, comp, vfrac, change, rt_new) if callback else False
+            stop = callback(it, comp, vfrac, change, rt_new, u, rt) if callback else False
             if stop or (change < 0.01 and it >= 15):
                 break
         return rt_new
@@ -659,6 +660,7 @@ class MeshModel:
         self.tri = tri
         self.tri_area = area
         self.tri_normal = n / np.maximum(2 * area, 1e-300)[:, None]
+        self.tri_centroid = P.mean(1)
         self.surf_corner = np.unique(tri)
 
     def _edge_maps(self):
@@ -676,7 +678,15 @@ class MeshModel:
             self.emids = ms[idx]
         tk = np.concatenate([key(tri[:, 0], tri[:, 1]), key(tri[:, 1], tri[:, 2]),
                              key(tri[:, 2], tri[:, 0])])
-        uk = np.unique(tk)
+        uk, inv = np.unique(tk, return_inverse=True)
+        T = len(tri)
+        ti = np.tile(np.arange(T), 3)
+        o = np.argsort(inv, kind="stable")
+        inv_s, ti_s = inv[o], ti[o]
+        start = np.searchsorted(inv_s, np.arange(len(uk)))
+        nxt = np.minimum(start + 1, len(inv_s) - 1)
+        two = (inv_s[nxt] == np.arange(len(uk))) & (nxt != start)
+        self.edge_tris = np.stack([ti_s[start], np.where(two, ti_s[nxt], -1)], axis=1)
         self.se_lo, self.se_hi = uk // N, uk % N
         if self.order == 2:
             self.se_mid = self.emids[np.searchsorted(self.ekeys, uk)]
@@ -741,6 +751,51 @@ class MeshModel:
         self._labels[key] = labels
         return labels
 
+    def nodes_of_edges(self, edge_idx):
+        """Knoten (inkl. Mittelknoten bei Tet10) der Oberflaechenkanten mit den Indizes edge_idx."""
+        e = np.asarray(edge_idx).ravel()
+        parts = [self.se_lo[e], self.se_hi[e]]
+        if self.order == 2:
+            parts.append(self.se_mid[e])
+        return np.unique(np.concatenate(parts))
+
+    def feature_edges(self, angle_deg):
+        """Kanten, an denen die beiden Nachbardreiecke um mehr als angle_deg abknicken."""
+        t1, t2 = self.edge_tris[:, 0], self.edge_tris[:, 1]
+        dots = np.einsum("ij,ij->i", self.tri_normal[t1], self.tri_normal[np.where(t2 >= 0, t2, 0)])
+        return (t2 >= 0) & (dots < math.cos(math.radians(angle_deg)))
+
+    def edge_chains(self, angle_deg):
+        """Kantenzuege (Geometriekanten): Label je Oberflaechenkante, -1 = keine Merkmalskante.
+        Ein Zug endet an Knoten, an denen sich mehr/weniger als zwei Merkmalskanten treffen
+        oder die Richtung um mehr als angle_deg knickt."""
+        key = ("chain", round(float(angle_deg), 3))
+        if key in self._labels:
+            return self._labels[key]
+        fe = np.flatnonzero(self.feature_edges(angle_deg))
+        labels = np.full(len(self.se_lo), -1, dtype=np.int64)
+        if len(fe):
+            lo, hi = self.se_lo[fe], self.se_hi[fe]
+            deg = np.bincount(np.concatenate([lo, hi]), minlength=self.nn)
+            cat_n = np.concatenate([lo, hi])
+            cat_e = np.concatenate([np.arange(len(fe)), np.arange(len(fe))])
+            o = np.argsort(cat_n, kind="stable")
+            ns, es = cat_n[o], cat_e[o]
+            i = np.flatnonzero((ns[:-1] == ns[1:]) & (deg[ns[:-1]] == 2))
+            v, e1, e2 = ns[i], es[i], es[i + 1]
+            o1 = np.where(lo[e1] == v, hi[e1], lo[e1])
+            o2 = np.where(lo[e2] == v, hi[e2], lo[e2])
+            d1, d2 = self.nodes[o1] - self.nodes[v], self.nodes[o2] - self.nodes[v]
+            cosang = np.einsum("ij,ij->i", d1, d2) / np.maximum(
+                np.linalg.norm(d1, axis=1) * np.linalg.norm(d2, axis=1), 1e-300)
+            cont = cosang <= -math.cos(math.radians(angle_deg))     # fast gerade Fortsetzung
+            g = sp.coo_matrix((np.ones(int(cont.sum())), (e1[cont], e2[cont])),
+                              shape=(len(fe), len(fe)))
+            _, comp = connected_components(g, directed=False)
+            labels[fe] = comp
+        self._labels[key] = labels
+        return labels
+
     def nodes_of_tris(self, tri_mask):
         return np.unique(self.tri_all[tri_mask].ravel())
 
@@ -763,7 +818,19 @@ class MeshModel:
             for k in range(3):
                 np.add.at(w, src[:, k], a)
         else:
-            w[ids] = 1.0
+            inE = inS[self.se_lo] & inS[self.se_hi]
+            if inE.any():                          # Linienlast entlang gewaehlter Kanten
+                lo, hi = self.se_lo[inE], self.se_hi[inE]
+                L = np.linalg.norm(self.nodes[hi] - self.nodes[lo], axis=1)
+                if self.order == 1:
+                    np.add.at(w, lo, L / 2)
+                    np.add.at(w, hi, L / 2)
+                else:
+                    np.add.at(w, lo, L / 6)
+                    np.add.at(w, hi, L / 6)
+                    np.add.at(w, self.se_mid[inE], 2 * L / 3)
+            else:
+                w[ids] = 1.0
         w = w[ids]
         if w.sum() <= 0:
             w = np.ones(len(ids))
@@ -795,30 +862,40 @@ def point_triangle_distance(P, A, B, C):
 
 def transfer_ids(old, new, ids):
     """Knotenauswahl auf ein neues Netz uebertragen (z.B. nach Neuvernetzung).
-    Flaechenauswahl: neue Oberflaechenknoten, die auf den urspruenglich markierten
-    Dreiecken liegen. Einzelknoten: jeweils der naechste neue Knoten."""
+    Flaechen: neue Oberflaechenknoten auf den markierten Dreiecken; Kanten: neue Knoten auf den
+    markierten Kanten; sonst jeweils der naechste neue Knoten."""
     ids = np.asarray(ids)
     inS = np.zeros(old.nn, bool)
     inS[ids] = True
-    tm = inS[old.tri].all(1)
-    if len(np.intersect1d(ids, old.surf_corner)) <= 3 or not tm.any():
-        return new.map_points(old.nodes[ids])[0]
-    sel = old.tri[tm]
-    A, B, C = (old.nodes[sel[:, k]] for k in range(3))
-    cen = (A + B + C) / 3
-    rad = np.maximum.reduce([np.linalg.norm(A - cen, axis=1), np.linalg.norm(B - cen, axis=1),
-                             np.linalg.norm(C - cen, axis=1)])
     P = new.nodes[new.surf_corner]
     Pn = new.nodes[new.tri]
     tol = 0.4 * float(np.mean(np.linalg.norm(Pn[:, 1] - Pn[:, 0], axis=1)))
-    cand = cKDTree(cen).query_ball_point(P, rad.max() + tol)
-    pi = np.repeat(np.arange(len(P)), [len(c) for c in cand])
-    ti = np.concatenate([np.asarray(c, np.int64) for c in cand]) if len(pi) else np.zeros(0, np.int64)
+    tm = inS[old.tri].all(1)
     keep = np.zeros(len(P), bool)
-    if len(pi):
-        d = point_triangle_distance(P[pi], A[ti], B[ti], C[ti])
-        keep[pi[d <= tol]] = True
-    return new.expand_selection(new.surf_corner[keep]) if keep.any() else new.map_points(old.nodes[ids])[0]
+    if tm.any():
+        sel = old.tri[tm]
+        A, B, C = (old.nodes[sel[:, k]] for k in range(3))
+        cen = (A + B + C) / 3
+        rad = np.maximum.reduce([np.linalg.norm(A - cen, axis=1), np.linalg.norm(B - cen, axis=1),
+                                 np.linalg.norm(C - cen, axis=1)])
+        cand = cKDTree(cen).query_ball_point(P, rad.max() + tol)
+        pi = np.repeat(np.arange(len(P)), [len(c) for c in cand])
+        ti = np.concatenate([np.asarray(c, np.int64) for c in cand]) if len(pi) else np.zeros(0, np.int64)
+        if len(pi):
+            keep[pi[point_triangle_distance(P[pi], A[ti], B[ti], C[ti]) <= tol]] = True
+    else:
+        inE = inS[old.se_lo] & inS[old.se_hi]
+        if inE.any():
+            A, B = old.nodes[old.se_lo[inE]], old.nodes[old.se_hi[inE]]
+            mid, rad = (A + B) / 2, np.linalg.norm(B - A, axis=1) / 2
+            cand = cKDTree(mid).query_ball_point(P, rad.max() + tol)
+            pi = np.repeat(np.arange(len(P)), [len(c) for c in cand])
+            ti = np.concatenate([np.asarray(c, np.int64) for c in cand]) if len(pi) else np.zeros(0, np.int64)
+            if len(pi):
+                keep[pi[_seg_dist(P[pi], A[ti], B[ti]) <= tol]] = True
+    if keep.any():
+        return new.expand_selection(new.surf_corner[keep])
+    return new.map_points(old.nodes[ids])[0]
 
 
 # ==========================================================================
@@ -832,7 +909,8 @@ def default_setup():
         material=dict(name=None, E=210000.0, nu=0.3, rp=None, rho=None),
         supports=[], loads=[],
         analysis=dict(type="static",
-                      topopt=dict(volfrac=0.4, rmin=None, penal=3.0, maxit=60)),
+                      topopt=dict(volfrac=0.4, rmin=None, penal=3.0, maxit=60,
+                                  save_dir=None, save_every=5, save_vtk=True)),
         output=dict(file=None))
 
 
@@ -1003,7 +1081,32 @@ def default_rmin(model):
     return 2.5 * float(cKDTree(cen).query(cen, k=2)[0][:, 1].mean())
 
 
-def run_analysis(setup, model, fem, callback=None):
+class IterationSaver:
+    """Schreibt waehrend der Topologieoptimierung Zwischenergebnisse in einen Ordner:
+    verlauf.csv (jede Iteration) und iter_NNNN.vtk (Spannung, Verschiebung, Dichte)."""
+
+    def __init__(self, folder, every=5, vtk=True):
+        self.dir = Path(folder)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.every, self.vtk = max(1, int(every)), bool(vtk)
+        self.csv = self.dir / "verlauf.csv"
+        self.csv.write_text("iteration;nachgiebigkeit;volumenanteil;aenderung\n")
+
+    def wanted(self, it):
+        return it == 1 or it % self.every == 0
+
+    def row(self, it, comp, vfrac, change):
+        with open(self.csv, "a") as fh:
+            fh.write(f"{it};{comp:.6g};{vfrac:.6f};{change:.6f}\n")
+
+    def save_vtk(self, name, model, fem, u, rho):
+        u3 = np.asarray(u).reshape(-1, 3)
+        pd = {"Verschiebung": u3, "u_mag_mm": np.linalg.norm(u3, axis=1),
+              "von_Mises_MPa": fem.vonmises_nodes(np.asarray(u).ravel())}
+        write_vtk(self.dir / f"iter_{name}.vtk", model.nodes, model.tets, pd, {"Dichte": rho})
+
+
+def run_analysis(setup, model, fem, callback=None, base_dir="."):
     """Statische Rechnung oder Topologieoptimierung gemaess Setup."""
     cmask, cval, F = build_bc(model, setup)
     if not cmask.any():
@@ -1030,8 +1133,23 @@ def run_analysis(setup, model, fem, callback=None):
         log("WARNUNG: Fest eingefrorene Bereiche an Lager/Last ueberschreiten den Zielvolumenanteil.")
     log(f"Topologieoptimierung: Volumenanteil {vf}, Filterradius {rmin:.3g} mm, p={p}, "
         f"max. {maxit} Iterationen, {int(passive.sum())} eingefrorene Elemente")
-    rt = fem.topopt(cmask, F, vf, rmin, p, maxit, passive, callback)
+    saver = None
+    if prm.get("save_dir"):
+        saver = IterationSaver(resolve_path(base_dir, prm["save_dir"]), prm.get("save_every", 5),
+                               prm.get("save_vtk", True))
+        log(f"Zwischenergebnisse werden gespeichert in {saver.dir} (alle {saver.every} Iterationen)")
+
+    def cb(it, comp, vfrac, change, rt_new, u, rt_used):
+        if saver is not None:
+            saver.row(it, comp, vfrac, change)
+            if saver.vtk and saver.wanted(it):
+                saver.save_vtk(f"{it:04d}", model, fem, u, rt_used)
+        return callback(it, comp, vfrac, change, rt_new, u, rt_used) if callback else False
+
+    rt = fem.topopt(cmask, F, vf, rmin, p, maxit, passive, cb)
     u = fem.solve_system(fem.assemble(fem.stiffness_factor(rt, p)), F, cmask, np.zeros(3 * model.nn))
+    if saver is not None and saver.vtk:
+        saver.save_vtk("final", model, fem, u, rt)
     return dict(u=u.reshape(-1, 3), vm=fem.vonmises_nodes(u), rho=rt, cmask=cmask, F=F)
 
 
@@ -1138,7 +1256,7 @@ def run_setup_file(json_path, out=None):
     fem = FEM(model.nodes, model.tets, float(mat["E"]), float(mat["nu"]))
     last = [0.0]
 
-    def cb(it, comp, vfrac, change, rt):
+    def cb(it, comp, vfrac, change, rt, u=None, rt_used=None):
         if time.time() - last[0] > 5 or it == 1:
             log(f"  TO Iteration {it}: Nachgiebigkeit {comp:.4g}, Volumen {vfrac:.3f}, "
                 f"Aenderung {change:.3f}")
@@ -1146,7 +1264,7 @@ def run_setup_file(json_path, out=None):
         return False
 
     t0 = time.time()
-    res = run_analysis(setup, model, fem, cb)
+    res = run_analysis(setup, model, fem, cb, base)
     for line in summarize(setup, model, fem, res):
         log(line)
     if out is None:

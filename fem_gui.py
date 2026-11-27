@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 fem_gui.py - Interaktive FEM mit Grafikfenster (Qt + PyVista)
 =============================================================
@@ -11,18 +10,25 @@ Ablauf im Fenster
 -----------------
 1. Datei > Bauteil oeffnen ...   (STEP, IGES, STL, OBJ, PLY, VTK, MSH)  oder  Demo-Balken
 2. Rechtsklick > Netzparameter ...  /  Vernetzen        (auch im Menue "Netz")
-3. Knoten waehlen (Menue "Auswahl" oder Rechtsklick > Auswahlmodus):
-     Knoten einzeln : Linksklick setzt/entfernt einen Knoten (Ctrl+Klick entfernt)
-     Flaeche        : Linksklick waehlt die zusammenhaengende Flaeche (Winkel einstellbar)
-     Rechteck       : Aufziehen eines Rechtecks (Ctrl = abwaehlen)
+3. Auswahl (Menue "Auswahl" oder Rechtsklick > Auswahlmodus); Klick setzt/entfernt, Ctrl+Klick entfernt:
+     Knoten einzeln : einzelner Netzknoten
+     Netzkante      : einzelne Elementkante auf der Oberflaeche (Linienlast moeglich)
+     Kantenzug      : ganze Geometriekante (z.B. Lochrand, Bauteilkante; Winkel einstellbar)
+     Netzflaeche    : einzelnes Oberflaechen-Dreieck
+     Flaeche        : zusammenhaengende Flaeche (Winkel einstellbar)
+     Rechteck       : Aufziehen eines Rechtecks
      Drehen         : nur Kamera (Linke Maustaste drehen, Mitte verschieben, Rad zoomen)
 4. Rechtsklick > Lager aus Auswahl ... / Kraft aus Auswahl ... / Netz lokal verfeinern ...
 5. Berechnen > Statisch  oder  Topologieoptimierung
-6. Ergebnis: Ansicht > Schnittmodus (C), Feld (F); Datei > Ergebnis als VTK exportieren
+6. Ergebnis: Werkzeugleiste (Feld: von Mises, Verschiebung gesamt/ux/uy/uz, Dichte; Schnitt; verformt)
+   oder Tasten C/F; Datei > Ergebnis als VTK exportieren.
+   Topologieoptimierung: Spannungsbilder (PNG) und VTK je Iteration koennen in einem Ordner
+   gespeichert werden.
 7. Datei > Setup speichern (fuer Server) ...   ->  Berechnung ohne Grafik:
        python fem_core.py run setup.json
 """
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -101,6 +107,33 @@ class OptFloat(QW.QWidget):
             self.spin.setValue(v)
 
 
+class FolderEdit(QW.QWidget):
+    """Textfeld mit Knopf zur Ordnerauswahl."""
+
+    def __init__(self, text=""):
+        super().__init__()
+        lay = QW.QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.edit = QW.QLineEdit(text)
+        b = QW.QPushButton("…")
+        b.setMaximumWidth(30)
+        b.clicked.connect(lambda checked=False: self.choose())
+        lay.addWidget(self.edit)
+        lay.addWidget(b)
+
+    def choose(self):
+        d = QW.QFileDialog.getExistingDirectory(self, "Ordner wählen", self.edit.text() or "")
+        if d:
+            self.edit.setText(d)
+
+    def text(self):
+        return self.edit.text()
+
+
+def _fname(s):
+    return re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_")
+
+
 class FormDialog(QW.QDialog):
     """Allgemeiner Eingabedialog. specs: (key, Beschriftung, art, standard[, optionen]);
     art: float | int | bool | choice | optfloat | text."""
@@ -138,6 +171,8 @@ class FormDialog(QW.QDialog):
             elif kind == "optfloat":
                 w = OptFloat(default, o.get("default", 1.0), o.get("auto", "automatisch"),
                              o.get("decimals", 4), o.get("min", 1e-9), o.get("max", 1e12))
+            elif kind == "folder":
+                w = FolderEdit(str(default or ""))
             else:
                 w = QW.QLineEdit(str(default or ""))
             self.w[key] = (kind, w)
@@ -295,6 +330,9 @@ class MainWindow(QW.QMainWindow):
         self.angle = 30.0
         self.view = "setup"
         self.cut_i = self.field_i = 0
+        self.show_deformed = True
+        self.fields = []
+        self._tb_block = False
         self.thr = 0.5
         self.scale = 1.0
         self._press = None
@@ -317,6 +355,7 @@ class MainWindow(QW.QMainWindow):
 
         self._build_docks()
         self._build_menus()
+        self._build_toolbar()
         core.set_logger(self.log)
         self.show_hint()
 
@@ -382,7 +421,11 @@ class MainWindow(QW.QMainWindow):
         grp = QG.QActionGroup(self)
         self.mode_actions = {}
         for key, txt in (("orbit", "Nur drehen (keine Auswahl)"), ("node", "Knoten einzeln"),
-                         ("face", "Fläche (zusammenhängend)"), ("box", "Rechteck aufziehen")):
+                         ("edge", "Netzkante (einzelne Elementkante)"),
+                         ("chain", "Kantenzug (Geometriekante, Winkel)"),
+                         ("tri", "Netzfläche (einzelnes Dreieck)"),
+                         ("face", "Fläche (zusammenhängend, Winkel)"),
+                         ("box", "Rechteck aufziehen")):
             a = QG.QAction(txt, self)
             a.setCheckable(True)
             a.setChecked(key == "orbit")
@@ -394,7 +437,7 @@ class MainWindow(QW.QMainWindow):
         self.vis_action = self._act(m, "Rechteck: nur sichtbare Seiten", lambda: None,
                                     checkable=True, checked=True)
         self.vis_action.toggled.connect(lambda on: setattr(self, "only_visible", on))
-        self._act(m, "Winkel für Flächenwahl …", self.set_angle)
+        self._act(m, "Winkel für Fläche/Kantenzug …", self.set_angle)
         self._act(m, "Auswahl löschen", self.clear_selection, "Esc")
 
         m = mb.addMenu("&Randbedingungen")
@@ -415,6 +458,61 @@ class MainWindow(QW.QMainWindow):
         self._act(m, "Schnittmodus wechseln", self.next_cut, "C")
         self._act(m, "Feld wechseln", self.next_field, "F")
         self._act(m, "Überhöhung ändern …", self.set_scale)
+        self._act(m, "Bild speichern (PNG) …", self.save_screenshot)
+
+    def _build_toolbar(self):
+        tb = self.addToolBar("Ergebnis")
+        tb.addWidget(QW.QLabel(" Feld: "))
+        self.field_box = QW.QComboBox()
+        self.field_box.setMinimumWidth(170)
+        tb.addWidget(self.field_box)
+        tb.addWidget(QW.QLabel("   Schnitt: "))
+        self.cut_box = QW.QComboBox()
+        self.cut_box.addItems(self.CUTS)
+        tb.addWidget(self.cut_box)
+        self.def_chk = QW.QCheckBox(" verformt ")
+        self.def_chk.setChecked(True)
+        tb.addWidget(self.def_chk)
+        self.field_box.currentIndexChanged.connect(self.on_field_box)
+        self.cut_box.currentIndexChanged.connect(self.on_cut_box)
+        self.def_chk.toggled.connect(self.on_def_toggle)
+        self.set_toolbar_enabled(False)
+
+    def set_toolbar_enabled(self, on):
+        for w in (self.field_box, self.cut_box, self.def_chk):
+            w.setEnabled(on)
+
+    def sync_toolbar(self):
+        self._tb_block = True
+        self.field_box.clear()
+        self.field_box.addItems(self.fields)
+        self.field_box.setCurrentIndex(self.field_i)
+        self.cut_box.setCurrentIndex(self.cut_i)
+        self.def_chk.setChecked(self.show_deformed)
+        self._tb_block = False
+        self.set_toolbar_enabled(True)
+
+    def on_field_box(self, i):
+        if not self._tb_block and self.view == "result" and 0 <= i < len(self.fields):
+            self.field_i = i
+            self.draw_result()
+
+    def on_cut_box(self, i):
+        if not self._tb_block and self.view == "result":
+            self.cut_i = i
+            self.draw_result()
+
+    def on_def_toggle(self, on):
+        if not self._tb_block and self.view == "result":
+            self.show_deformed = bool(on)
+            self.build_rmesh()
+            self.draw_result()
+
+    def save_screenshot(self):
+        path, _ = QW.QFileDialog.getSaveFileName(self, "Bild speichern", "bild.png", "PNG (*.png)")
+        if path:
+            self.plotter.screenshot(path)
+            self.log(f"Bild gespeichert: {path}")
 
     def show_context_menu(self):
         m = QW.QMenu(self)
@@ -654,6 +752,7 @@ class MainWindow(QW.QMainWindow):
         if reset:
             self.plotter.reset_camera()
         self.view = "setup"
+        self.set_toolbar_enabled(False)
         self.redraw_markers()
         self.update_sel_actor()
         self.update_matinfo()
@@ -730,9 +829,13 @@ class MainWindow(QW.QMainWindow):
         self.mode = mode
         self.mode_actions[mode].setChecked(True)
         self.log({"orbit": "Modus: nur drehen.",
-                  "node": "Modus: Knoten einzeln (Klick = setzen/entfernen, Ctrl+Klick = entfernen).",
+                  "node": "Modus: Knoten einzeln (Klick = setzen/entfernen, Strg+Klick = entfernen).",
+                  "edge": "Modus: Netzkante (Klick auf eine Elementkante der Oberfläche).",
+                  "chain": "Modus: Kantenzug (Klick auf eine Geometriekante wählt den ganzen Zug; "
+                           "Winkel im Menü Auswahl).",
+                  "tri": "Modus: Netzfläche (Klick wählt ein einzelnes Oberflächen-Dreieck).",
                   "face": "Modus: Fläche (Klick wählt die zusammenhängende Fläche).",
-                  "box": "Modus: Rechteck (aufziehen; Ctrl = abwählen). Zum Drehen anderen Modus wählen."}[mode])
+                  "box": "Modus: Rechteck (aufziehen; Strg = abwählen). Zum Drehen anderen Modus wählen."}[mode])
 
     def set_angle(self):
         v, ok = QW.QInputDialog.getDouble(self, "Flächenwahl", "Max. Knickwinkel zwischen Dreiecken [°]:",
@@ -771,7 +874,7 @@ class MainWindow(QW.QMainWindow):
                     self.box_select(rect, ev.modifiers())
                     return True
                 if p and p[0] == b and (ev.pos() - p[1]).manhattanLength() < 5:
-                    if b == QC.Qt.LeftButton and self.mode in ("node", "face") \
+                    if b == QC.Qt.LeftButton and self.mode in ("node", "edge", "chain", "tri", "face") \
                             and self.model is not None and self.view == "setup":
                         self.click_select(QC.QPoint(ev.pos()), ev.modifiers())
                     elif b == QC.Qt.RightButton:
@@ -822,26 +925,105 @@ class MainWindow(QW.QMainWindow):
         cand = cand[depth <= depth.min() + 0.03 * m.diag]
         return int(ids[cand[np.argmin(d[cand])]])
 
+    def _wh(self):
+        return self.plotter.interactor.width(), self.plotter.interactor.height()
+
+    def facing_tri(self):
+        m = self.model
+        pos, d, parallel = self.camera_vectors()
+        v = -d[None, :] if parallel else pos[None, :] - m.tri_centroid
+        return np.einsum("ij,ij->i", m.tri_normal, np.broadcast_to(v, m.tri_normal.shape)) > 0
+
+    def pick_triangle(self, pos):
+        """Vorderstes Oberflaechen-Dreieck unter dem Cursor (Punkt-im-Dreieck im Bildraum)."""
+        m = self.model
+        W, H = self._wh()
+        u, v, _, w = self.project(m.nodes[m.tri].reshape(-1, 3))
+        px, py = (u * W).reshape(-1, 3), ((1 - v) * H).reshape(-1, 3)
+        okw = (w > 0).reshape(-1, 3).all(1)
+        x, y = pos.x(), pos.y()
+        ax, bx, cx = px.T
+        ay, by, cy = py.T
+        d = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+        dd = np.where(np.abs(d) < 1e-9, 1e-9, d)
+        l1 = ((by - cy) * (x - cx) + (cx - bx) * (y - cy)) / dd
+        l2 = ((cy - ay) * (x - cx) + (ax - cx) * (y - cy)) / dd
+        front = self.facing_tri() & okw
+        inside = front & (np.abs(d) > 1e-9) & (l1 >= 0) & (l2 >= 0) & (1 - l1 - l2 >= 0)
+        campos, vdir, _ = self.camera_vectors()
+        depth = (m.tri_centroid - campos) @ vdir
+        if inside.any():
+            c = np.flatnonzero(inside)
+            return int(c[np.argmin(depth[c])])
+        cu, cv, _, cw = self.project(m.tri_centroid)
+        dist = np.hypot(cu * W - x, (1 - cv) * H - y)
+        ok = front & (dist < 15)
+        if not ok.any():
+            return None
+        c = np.flatnonzero(ok)
+        return int(c[np.argmin(dist[c])])
+
+    def pick_edge(self, pos, radius=10):
+        """Naechste sichtbare Oberflaechenkante (Abstand Cursor-Strecke im Bildraum)."""
+        m = self.model
+        W, H = self._wh()
+        u0, v0, _, w0 = self.project(m.nodes[m.se_lo])
+        u1, v1, _, w1 = self.project(m.nodes[m.se_hi])
+        x0, y0, x1, y1 = u0 * W, (1 - v0) * H, u1 * W, (1 - v1) * H
+        dx, dy = x1 - x0, y1 - y0
+        t = np.clip(((pos.x() - x0) * dx + (pos.y() - y0) * dy) / np.maximum(dx * dx + dy * dy, 1e-9), 0, 1)
+        dist = np.hypot(x0 + t * dx - pos.x(), y0 + t * dy - pos.y())
+        tf = self.facing_tri()
+        t1, t2 = m.edge_tris[:, 0], m.edge_tris[:, 1]
+        vis = tf[t1] | ((t2 >= 0) & tf[np.where(t2 >= 0, t2, 0)])
+        ok = vis & (w0 > 0) & (w1 > 0) & (dist < radius)
+        if not ok.any():
+            return None
+        c = np.flatnonzero(ok)
+        campos, vdir, _ = self.camera_vectors()
+        depth = ((m.nodes[m.se_lo[c]] + m.nodes[m.se_hi[c]]) / 2 - campos) @ vdir
+        c = c[depth <= depth.min() + 0.03 * m.diag]
+        return int(c[np.argmin(dist[c])])
+
+    def _apply_sel(self, nodes, ctrl):
+        """Klick: hinzufuegen; ist alles schon gewaehlt oder Strg gedrueckt: entfernen."""
+        if ctrl or self.sel[nodes].all():
+            self.sel[nodes] = False
+        else:
+            self.sel[nodes] = True
+
     def click_select(self, pos, mod):
         m = self.model
-        remove = bool(mod & QC.Qt.ControlModifier)
-        if self.mode == "node":
+        ctrl = bool(mod & QC.Qt.ControlModifier)
+        mode = self.mode
+        if mode == "node":
             n = self.pick_node(pos)
             if n is None:
                 return
-            self.sel[n] = False if remove else not self.sel[n]
-        else:
-            n = self.pick_node(pos, 22)
-            if n is None:
+            self._apply_sel(np.array([n]), ctrl)
+        elif mode == "tri":
+            t = self.pick_triangle(pos)
+            if t is None:
                 return
-            tris = m.tris_of_node(n)
-            if len(tris) == 0:
+            self._apply_sel(np.unique(m.tri_all[t]), ctrl)
+        elif mode in ("edge", "chain"):
+            e = self.pick_edge(pos)
+            if e is None:
                 return
-            u, v, _, _ = self.project(m.nodes[m.tri[tris]].mean(1))
-            W, H = self.plotter.interactor.width(), self.plotter.interactor.height()
-            best = tris[np.argmin(np.hypot(u * W - pos.x(), (1 - v) * H - pos.y()))]
+            edges = np.array([e])
+            if mode == "chain":
+                lab = m.edge_chains(self.angle)
+                if lab[e] >= 0:
+                    edges = np.flatnonzero(lab == lab[e])
+                else:
+                    self.log("Keine Geometriekante (Winkel zu klein?) - einzelne Netzkante gewählt.")
+            self._apply_sel(m.nodes_of_edges(edges), ctrl)
+        else:                                       # zusammenhaengende Flaeche
+            t = self.pick_triangle(pos)
+            if t is None:
+                return
             lab = m.face_labels(self.angle)
-            self.sel[m.nodes_of_tris(lab == lab[best])] = not remove
+            self._apply_sel(m.nodes_of_tris(lab == lab[t]), ctrl)
         self.update_sel_actor()
 
     def box_select(self, rect, mod):
@@ -1007,12 +1189,26 @@ class MainWindow(QW.QMainWindow):
              ("rmin", "Filterradius [mm]", "optfloat", a.get("rmin"),
               dict(default=rm, auto=f"automatisch ({rm:.3g} mm)")),
              ("penal", "Penalisierung p", "float", a["penal"], dict(min=1, max=6, decimals=1)),
-             ("maxit", "Max. Iterationen", "int", a["maxit"], dict(min=1, max=1000))],
+             ("maxit", "Max. Iterationen", "int", a["maxit"], dict(min=1, max=1000)),
+             ("live", "Anzeige während der Optimierung", "choice", int(a.get("live", 0)),
+              dict(items=["Spannung (von Mises)", "Verschiebung", "Dichte"])),
+             ("thr", "Elemente anzeigen ab Dichte", "float", a.get("img_thr", 0.3),
+              dict(min=0.05, max=0.95, decimals=2)),
+             ("save", "Bilder je Iteration speichern", "bool", bool(a.get("save_dir"))),
+             ("folder", "Ordner", "folder", a.get("save_dir") or ""),
+             ("every", "Speichern alle n Iterationen", "int", a.get("save_every", 5), dict(min=1, max=1000)),
+             ("vtk", "zusätzlich VTK-Dateien (Spannung, Verschiebung, Dichte)", "bool", a.get("save_vtk", True))],
             info="Minimiert die Nachgiebigkeit bei vorgegebenem Volumen (SIMP). Elemente an Lagern und "
-                 "Lasten bleiben erhalten. Abbruch über den Dialog möglich.")
+                 "Lasten bleiben erhalten. Beim Speichern entstehen PNG-Bilder der gewählten Anzeige, "
+                 "optional VTK-Dateien und verlauf.csv. Abbruch über den Fortschrittsdialog möglich.")
         if vals is None:
             return
-        a.update(volfrac=vals["volfrac"], rmin=vals["rmin"], penal=vals["penal"], maxit=vals["maxit"])
+        folder = vals["folder"].strip()
+        if vals["save"] and not folder:
+            return self.error("Zum Speichern bitte einen Ordner angeben.")
+        a.update(volfrac=vals["volfrac"], rmin=vals["rmin"], penal=vals["penal"], maxit=vals["maxit"],
+                 live=vals["live"], img_thr=vals["thr"], save_dir=folder if vals["save"] else None,
+                 save_every=vals["every"], save_vtk=vals["vtk"])
         self._run("topopt")
 
     def grid4(self):
@@ -1028,9 +1224,17 @@ class MainWindow(QW.QMainWindow):
         if self.view == "result":
             self.show_body()
         self.setup["analysis"]["type"] = kind
-        prog, cb = None, None
+        prog = cb = folder = None
+        try:
+            fem = self.get_fem()
+        except Exception as e:
+            return self.error(f"Steifigkeitsmatrizen konnten nicht aufgebaut werden: {e}")
         if kind == "topopt":
-            maxit = int(self.setup["analysis"]["topopt"]["maxit"])
+            a = self.setup["analysis"]["topopt"]
+            maxit, live, thr = int(a["maxit"]), int(a.get("live", 0)), float(a.get("img_thr", 0.3))
+            folder = Path(a["save_dir"]) if a.get("save_dir") else None
+            every = max(1, int(a.get("save_every", 5)))
+            fieldname = ["von Mises [MPa]", "u [mm]", "Dichte"][live]
             prog = QW.QProgressDialog("Topologieoptimierung läuft ...", "Abbrechen", 0, maxit, self)
             prog.setWindowModality(QC.Qt.WindowModal)
             prog.setMinimumDuration(0)
@@ -1038,21 +1242,33 @@ class MainWindow(QW.QMainWindow):
             g0 = self.grid4().copy()
             self.plotter.remove_actor("body")
 
-            def cb(it, comp, vfrac, change, rt):
-                if it == 1 or it % 3 == 0:
-                    g0.cell_data["Dichte"] = rt
-                    shown = g0.threshold(0.5, scalars="Dichte")
+            def cb(it, comp, vfrac, change, rt_new, u, rt_used):
+                save_img = folder is not None and (it == 1 or it % every == 0)
+                if it == 1 or it % 3 == 0 or save_img:
+                    g0.cell_data["Dichte"] = rt_used
+                    g0.point_data["u [mm]"] = np.linalg.norm(u.reshape(-1, 3), axis=1)
+                    if live == 0:
+                        g0.point_data["von Mises [MPa]"] = fem.vonmises_nodes(u)
+                    shown = g0.threshold(thr, scalars="Dichte")
                     if shown.n_cells:
-                        self.plotter.add_mesh(shown.extract_surface(), scalars="Dichte", cmap="gray_r",
-                                              clim=(0, 1), show_scalar_bar=False, name="to",
-                                              reset_camera=False)
+                        kw = dict(scalars=fieldname, name="to", reset_camera=False,
+                                  scalar_bar_args=dict(title=fieldname),
+                                  cmap="gray_r" if live == 2 else "turbo")
+                        if live == 2:
+                            kw["clim"] = (0.0, 1.0)
+                        self.plotter.add_mesh(shown.extract_surface(), **kw)
+                    self.plotter.add_text(f"Iteration {it}: Nachgiebigkeit {comp:.4g}, Volumen {vfrac:.3f}",
+                                          position="upper_left", font_size=9, name="itertxt")
+                    self.plotter.render()
+                    if save_img:
+                        folder.mkdir(parents=True, exist_ok=True)
+                        self.plotter.screenshot(str(folder / f"iter_{it:04d}_{_fname(fieldname)}.png"))
                 self.log(f"TO Iteration {it}/{maxit}: Nachgiebigkeit {comp:.4g}, Volumen {vfrac:.3f}, "
                          f"Änderung {change:.3f}")
                 prog.setValue(it)
                 QW.QApplication.processEvents()
                 return prog.wasCanceled()
         try:
-            fem = self.get_fem()
             with Busy():
                 res = core.run_analysis(self.setup, self.model, fem, cb)
         except FemError as e:
@@ -1073,21 +1289,43 @@ class MainWindow(QW.QMainWindow):
         for line in core.summarize(self.setup, self.model, fem, res):
             self.log(line)
         self.enter_result("Dichte" if res["rho"] is not None else None)
+        if folder is not None:
+            self.save_final_images(folder)
+
+    def save_final_images(self, folder):
+        """Endbilder (Spannung, Verschiebung, Dichte) in den Ordner schreiben."""
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            keep = (self.field_i, self.cut_i)
+            for f in ("von Mises [MPa]", "u [mm]", "Dichte"):
+                if f in self.fields:
+                    self.field_i = self.fields.index(f)
+                    self.draw_result()
+                    self.plotter.screenshot(str(folder / f"final_{_fname(f)}.png"))
+            self.field_i, self.cut_i = keep
+            self.draw_result()
+            self.log(f"Zwischen- und Endbilder gespeichert in {folder}")
+        except Exception as e:
+            self.log(f"Bilder konnten nicht gespeichert werden: {e}")
 
     # ---------------------------------------------------- Ergebnisse
     def enter_result(self, prefer=None):
         r, m = self.res, self.model
         g = self.grid4().copy()
-        umag = np.linalg.norm(r["u"], axis=1)
-        g.point_data["Verschiebung"] = r["u"]
+        u = r["u"]
+        umag = np.linalg.norm(u, axis=1)
+        g.point_data["Verschiebung"] = u
         g.point_data["u [mm]"] = umag
+        for k, nm in enumerate("xyz"):
+            g.point_data[f"u{nm} [mm]"] = u[:, k]
         g.point_data["von Mises [MPa]"] = r["vm"]
         if r["rho"] is not None:
             g.cell_data["Dichte"] = r["rho"]
         um = umag[m.corner_ids].max()
         self.scale = 0.08 * m.diag / um if um > 0 else 1.0
         self.rmesh_src = g
-        self.fields = ["von Mises [MPa]", "u [mm]"] + (["Dichte"] if r["rho"] is not None else [])
+        self.fields = (["von Mises [MPa]", "u [mm]", "ux [mm]", "uy [mm]", "uz [mm]"]
+                       + (["Dichte"] if r["rho"] is not None else []))
         self.field_i = self.fields.index(prefer) if prefer in self.fields else 0
         self.cut_i = 0
         self.view = "result"
@@ -1095,7 +1333,8 @@ class MainWindow(QW.QMainWindow):
         self.draw_result()
 
     def build_rmesh(self):
-        self.rmesh = self.rmesh_src.warp_by_vector("Verschiebung", factor=self.scale)
+        self.rmesh = self.rmesh_src.warp_by_vector("Verschiebung",
+                                                   factor=self.scale if self.show_deformed else 0.0)
 
     def set_scale(self):
         if self.view != "result":
@@ -1104,6 +1343,7 @@ class MainWindow(QW.QMainWindow):
                                           self.scale, 0.0, 1e9, 2)
         if ok:
             self.scale = v
+            self.show_deformed = True
             self.build_rmesh()
             self.draw_result()
 
@@ -1124,7 +1364,11 @@ class MainWindow(QW.QMainWindow):
             base = mesh.threshold(self.thr, scalars="Dichte")
         else:
             arr = mesh.point_data[field][m.corner_ids]
-            clim, cmap = (float(arr.min()), float(arr.max())), "turbo"
+            if field[:2] in ("ux", "uy", "uz"):                 # Komponenten: symmetrische Skala
+                a = max(float(np.abs(arr).max()), 1e-30)
+                clim, cmap = (-a, a), "coolwarm"
+            else:
+                clim, cmap = (float(arr.min()), float(arr.max())), "turbo"
             base = mesh
         if base.n_cells == 0:
             return self.log("Leere Auswahl (Dichte-Schwelle zu hoch).")
@@ -1145,8 +1389,10 @@ class MainWindow(QW.QMainWindow):
             pl.add_mesh(mesh.extract_surface(), style="wireframe", color="gray", opacity=0.15,
                         name="ghost")
         pl.render()
-        self.log(f"{field} | Schnitt: {cut} | {self.scale:.1f}-fach überhöht | "
-                 "C = Schnittmodus, F = Feld, F2 = zurück")
+        self.sync_toolbar()
+        self.log(f"{field} | Schnitt: {cut} | "
+                 + (f"{self.scale:.1f}-fach überhöht" if self.show_deformed else "unverformt")
+                 + " | Werkzeugleiste: Feld/Schnitt, Tasten C/F, F2 = zurück")
 
     def next_cut(self):
         if self.view == "result":
@@ -1188,6 +1434,10 @@ class MainWindow(QW.QMainWindow):
              ("rmin", "TO: Filterradius [mm]", "optfloat", t.get("rmin"), dict(default=rm)),
              ("penal", "TO: Penalisierung p", "float", t["penal"], dict(min=1, max=6, decimals=1)),
              ("maxit", "TO: Max. Iterationen", "int", t["maxit"], dict(min=1, max=1000)),
+             ("sdir", "TO: Ordner für Zwischenergebnisse (leer = nicht speichern)", "text",
+              t.get("save_dir") or ""),
+             ("every", "TO: Zwischenergebnis alle n Iterationen", "int", t.get("save_every", 5),
+              dict(min=1, max=1000)),
              ("out", "Ergebnisdatei", "text", self.setup["output"].get("file") or "ergebnis.vtk"),
              ("mesh", "Netz mitspeichern (empfohlen)", "bool", self.model is not None)],
             info="Speichert Geometrie-Verweis, Netzparameter, Material, Lager, Lasten und Analyse als "
@@ -1198,7 +1448,8 @@ class MainWindow(QW.QMainWindow):
         if not path:
             return
         a.update(type="static" if vals["type"] == 0 else "topopt")
-        t.update(volfrac=vals["volfrac"], rmin=vals["rmin"], penal=vals["penal"], maxit=vals["maxit"])
+        t.update(volfrac=vals["volfrac"], rmin=vals["rmin"], penal=vals["penal"], maxit=vals["maxit"],
+                 save_dir=vals["sdir"].strip() or None, save_every=vals["every"], save_vtk=True)
         self.setup["output"]["file"] = vals["out"].strip() or "ergebnis.vtk"
         try:
             mesh_file = core.save_setup(self.setup, path, self.model, vals["mesh"] and self.model is not None)
